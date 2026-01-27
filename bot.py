@@ -1,18 +1,136 @@
+# bot.py
 import os
-import requests
-import json
 import re
+import json
+import requests
+
+import matplotlib
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 from io import BytesIO
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 GROK_WALLET_URL = "https://thegrokwallet.com/"
 
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; DebtReliefBot/1.0)"
 }
+
+# Base mainnet public RPC
+BASE_RPC_URL = "https://mainnet.base.org"
+
+# Grok wallet address (the one shown in thegrokwallet.com)
+GROK_WALLET = "0xb1058c959987e3513600eb5b4fd82aeee2a0e4f9"
+
+# Tokens on Base
+DRB_TOKEN = "0x3ec2156d4c0a9cbdab4a016633b7bcf6a8d68ea2"
+WETH_TOKEN = "0x4200000000000000000000000000000000000006"
+
+# Dexscreener for USD prices
+DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
+
+# Colors
+WETH_COLOR = "#627EEA"  # Ethereum purple
+DRB_COLOR = "#B49C94"   # Cream from your reference
+
+
+def _rpc_call(method: str, params: list):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = requests.post(BASE_RPC_URL, json=payload, headers=UA_HEADERS, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(str(j["error"]))
+    return j["result"]
+
+
+def _pad32_hex_address(addr: str) -> str:
+    a = addr.lower().replace("0x", "")
+    return a.rjust(64, "0")
+
+
+def _eth_call(to_addr: str, data: str) -> str:
+    return _rpc_call("eth_call", [{"to": to_addr, "data": data}, "latest"])
+
+
+def erc20_decimals(token_addr: str) -> int:
+    out = _eth_call(token_addr, "0x313ce567")
+    return int(out, 16)
+
+
+def erc20_balance_of(token_addr: str, wallet_addr: str) -> int:
+    selector = "0x70a08231"
+    data = selector + _pad32_hex_address(wallet_addr)
+    out = _eth_call(token_addr, data)
+    return int(out, 16)
+
+
+def fetch_price_usd_from_dexscreener(token_addr: str) -> float:
+    r = requests.get(DEXSCREENER_TOKEN_URL + token_addr, headers=UA_HEADERS, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    pairs = j.get("pairs") or []
+
+    best_price = None
+    best_liq = -1.0
+
+    for p in pairs:
+        try:
+            price = float(p.get("priceUsd") or 0.0)
+            liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
+        except Exception:
+            continue
+
+        if price > 0 and liq > best_liq:
+            best_liq = liq
+            best_price = price
+
+    if best_price is None:
+        raise RuntimeError("Dexscreener priceUsd not found")
+
+    return best_price
+
+
+def fmt_amount(amount_int: int, decimals: int, max_decimals: int = 6) -> str:
+    if decimals <= 0:
+        return f"{amount_int:,}"
+    v = amount_int / (10 ** decimals)
+    s = f"{v:,.{max_decimals}f}".rstrip("0").rstrip(".")
+    return s
+
+
+def fmt_usd(x: float) -> str:
+    return f"${x:,.0f}"
+
+
+def fetch_balances_and_values():
+    drb_dec = erc20_decimals(DRB_TOKEN)
+    weth_dec = erc20_decimals(WETH_TOKEN)
+
+    drb_bal = erc20_balance_of(DRB_TOKEN, GROK_WALLET)
+    weth_bal = erc20_balance_of(WETH_TOKEN, GROK_WALLET)
+
+    drb_price = fetch_price_usd_from_dexscreener(DRB_TOKEN)
+    weth_price = fetch_price_usd_from_dexscreener(WETH_TOKEN)
+
+    drb_amt = drb_bal / (10 ** drb_dec)
+    weth_amt = weth_bal / (10 ** weth_dec)
+
+    drb_usd = drb_amt * drb_price
+    weth_usd = weth_amt * weth_price
+
+    return {
+        "DRB": {"amount": fmt_amount(drb_bal, drb_dec), "usd": fmt_usd(drb_usd), "usd_float": float(drb_usd)},
+        "WETH": {"amount": fmt_amount(weth_bal, weth_dec), "usd": fmt_usd(weth_usd), "usd_float": float(weth_usd)},
+    }
 
 
 def _parse_next_data(html: str):
@@ -34,23 +152,6 @@ def _deep_find_first_usd_near_label(obj, label_words):
 
     def norm(s: str) -> str:
         return re.sub(r"\s+", " ", s.strip().lower())
-
-    def walk(x):
-        if isinstance(x, dict):
-            for k, v in x.items():
-                r = walk(v)
-                if r:
-                    return r
-        elif isinstance(x, list):
-            for it in x:
-                r = walk(it)
-                if r:
-                    return r
-        elif isinstance(x, str):
-            s = norm(x)
-            if all(w in s for w in label_words):
-                return True
-        return None
 
     def find_usd_in_container(container):
         if isinstance(container, dict):
@@ -113,6 +214,90 @@ def fetch_historical_fees_claimed():
     raise RuntimeError("Could not parse Historical Fees Claimed")
 
 
+def generate_balance_donut(drb_amount_str: str, drb_usd: float, weth_amount_str: str, weth_usd: float):
+    total = drb_usd + weth_usd
+
+    values = [drb_usd, weth_usd]
+    colors = [DRB_COLOR, WETH_COLOR]
+
+    fig, ax = plt.subplots(figsize=(6.2, 6.2))
+    ax.pie(values, colors=colors, startangle=90, wedgeprops=dict(width=0.35))
+    ax.set(aspect="equal")
+    ax.set_title("DebtReliefBot Balance", fontsize=18, fontweight="bold", pad=16)
+
+    ax.text(
+        0, 0,
+        f"${total:,.0f}",
+        ha="center",
+        va="center",
+        fontsize=22,
+        fontweight="bold",
+        color="#111111",
+    )
+    ax.text(
+        0, -0.18,
+        "Total USD",
+        ha="center",
+        va="center",
+        fontsize=11,
+        color="#666666",
+    )
+
+    legend_rows = [
+        ("DRB", drb_amount_str, fmt_usd(drb_usd), DRB_COLOR),
+        ("WETH", weth_amount_str, fmt_usd(weth_usd), WETH_COLOR),
+    ]
+
+    y0 = -0.10
+    line_h = 0.11
+
+    for i, (sym, amt, usd_str, col) in enumerate(legend_rows):
+        y = y0 - i * line_h
+
+        ax.add_patch(
+            Rectangle(
+                (0.10, y - 0.018),
+                0.030,
+                0.030,
+                transform=ax.transAxes,
+                clip_on=False,
+                facecolor=col,
+                edgecolor="none",
+            )
+        )
+
+        ax.text(
+            0.15,
+            y,
+            f"{sym}: {amt}",
+            transform=ax.transAxes,
+            ha="left",
+            va="center",
+            fontsize=12,
+            color="#111111",
+            fontweight="bold",
+        )
+
+        ax.text(
+            0.90,
+            y,
+            usd_str,
+            transform=ax.transAxes,
+            ha="right",
+            va="center",
+            fontsize=12,
+            color="#111111",
+            fontweight="bold",
+        )
+
+    buf = BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=170, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
 async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -122,45 +307,55 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b = fetch_balances_and_values()
 
         drb_amount = b["DRB"]["amount"]
-        drb_usd_str = b["DRB"]["usd"]
+        drb_usd_val = b["DRB"]["usd_float"]
+
         weth_amount = b["WETH"]["amount"]
-        weth_usd_str = b["WETH"]["usd"]
+        weth_usd_val = b["WETH"]["usd_float"]
 
         donut = generate_balance_donut(
             drb_amount_str=drb_amount,
-            drb_usd_str=drb_usd_str,
+            drb_usd=drb_usd_val,
             weth_amount_str=weth_amount,
-            weth_usd_str=weth_usd_str,
+            weth_usd=weth_usd_val,
         )
 
         fees_claimed = fetch_historical_fees_claimed()
 
         caption = (
             "DebtReliefBot Balance\n"
-            f"$DRB: {drb_amount} ({drb_usd_str})\n"
-            f"$WETH: {weth_amount} ({weth_usd_str})\n\n"
+            f"$DRB: {drb_amount} ({fmt_usd(drb_usd_val)})\n"
+            f"$WETH: {weth_amount} ({fmt_usd(weth_usd_val)})\n\n"
             f"{fees_claimed}\n"
             "Historical Fees Claimed"
         )
 
         await msg.reply_photo(photo=donut, caption=caption)
 
-    except Exception:
+    except Exception as e:
+        print("grok_command error:", repr(e))
         await msg.reply_text("Error fetching balances")
+
+
+async def on_startup(app):
+    if ADMIN_ID <= 0:
+        return
+    try:
+        await app.bot.send_message(chat_id=ADMIN_ID, text="Bot started")
+    except Exception as e:
+        print("startup message failed:", repr(e))
 
 
 def main():
     app = (
         ApplicationBuilder()
-        .token(os.environ["BOT_TOKEN"])
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
         .build()
     )
 
     app.add_handler(CommandHandler("grok", grok_command))
-
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
