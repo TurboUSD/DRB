@@ -19,7 +19,10 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 GROK_WALLET_URL = "https://thegrokwallet.com/"
-UA_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DebtReliefBot/1.0)"}
+
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; DebtReliefBot/1.0)"
+}
 
 WETH_COLOR = "#627EEA"
 DRB_COLOR = "#B49C94"
@@ -39,17 +42,6 @@ def _parse_next_data(html: str):
         return None
 
 
-def _normalize_usd(s: str) -> str:
-    s = str(s).strip()
-    if s.startswith("$"):
-        return s
-    try:
-        x = float(s.replace(",", ""))
-        return f"${x:,.0f}"
-    except Exception:
-        return s
-
-
 def _deep_find_token(obj, symbol: str):
     symbol = symbol.upper()
 
@@ -58,9 +50,9 @@ def _deep_find_token(obj, symbol: str):
             sym = x.get("symbol") or x.get("ticker") or x.get("name")
             if isinstance(sym, str) and sym.upper() == symbol:
                 amount = x.get("amount") or x.get("balance") or x.get("qty")
-                usd = x.get("usd") or x.get("usdValue") or x.get("valueUsd") or x.get("value") or x.get("priceUsd")
+                usd = x.get("usd") or x.get("usdValue") or x.get("valueUsd") or x.get("value")
                 if amount is not None and usd is not None:
-                    return {"amount": str(amount), "usd": _normalize_usd(usd)}
+                    return {"amount": str(amount), "usd": str(usd)}
             for v in x.values():
                 r = walk(v)
                 if r:
@@ -75,6 +67,17 @@ def _deep_find_token(obj, symbol: str):
     return walk(obj)
 
 
+def _normalize_usd(s: str) -> str:
+    s = str(s).strip()
+    if s.startswith("$"):
+        return s
+    try:
+        x = float(s.replace(",", ""))
+        return f"${x:,.0f}"
+    except Exception:
+        return s
+
+
 def _extract_token_block_from_html(html: str, symbol: str):
     sym = symbol.upper()
 
@@ -82,8 +85,8 @@ def _extract_token_block_from_html(html: str, symbol: str):
     if not idx:
         return None
 
-    start = max(idx.start() - 1500, 0)
-    end = min(idx.start() + 1500, len(html))
+    start = max(idx.start() - 2200, 0)
+    end = min(idx.start() + 2200, len(html))
     chunk = html[start:end]
 
     usd_m = re.search(r"\$[\d\.,]+", chunk)
@@ -93,6 +96,36 @@ def _extract_token_block_from_html(html: str, symbol: str):
         return None
 
     return {"amount": amt_m.group(0), "usd": usd_m.group(0)}
+
+
+def fetch_balances_and_values():
+    r = requests.get(GROK_WALLET_URL, headers=UA_HEADERS, timeout=25)
+    r.raise_for_status()
+    html = r.text
+
+    next_data = _parse_next_data(html)
+
+    drb = None
+    eth = None
+
+    if next_data is not None:
+        drb = _deep_find_token(next_data, "DRB")
+        eth = _deep_find_token(next_data, "ETH")
+
+    if not drb:
+        drb = _extract_token_block_from_html(html, "DRB")
+    if not eth:
+        eth = _extract_token_block_from_html(html, "ETH")
+
+    if not drb or not eth:
+        raise RuntimeError("Could not parse DRB or ETH from thegrokwallet.com")
+
+    return {
+        "DRB": {"amount": str(drb["amount"]).strip(), "usd": _normalize_usd(drb["usd"])},
+        "WETH": {"amount": str(eth["amount"]).strip(), "usd": _normalize_usd(eth["usd"])},
+        "html": html,
+        "next_data": next_data,
+    }
 
 
 def _deep_find_first_usd_near_label(obj, label_words):
@@ -140,40 +173,7 @@ def _deep_find_first_usd_near_label(obj, label_words):
     return walk_with_parent(obj)
 
 
-def fetch_grokwallet_page_html():
-    r = requests.get(GROK_WALLET_URL, headers=UA_HEADERS, timeout=25)
-    r.raise_for_status()
-    return r.text
-
-
-def fetch_balances_from_grokwallet():
-    html = fetch_grokwallet_page_html()
-    next_data = _parse_next_data(html)
-
-    drb = None
-    eth = None
-
-    if next_data is not None:
-        drb = _deep_find_token(next_data, "DRB")
-        eth = _deep_find_token(next_data, "ETH")
-
-    if not drb:
-        drb = _extract_token_block_from_html(html, "DRB")
-    if not eth:
-        eth = _extract_token_block_from_html(html, "ETH")
-
-    if not drb or not eth:
-        raise RuntimeError("Could not parse DRB or ETH from thegrokwallet.com")
-
-    return {
-        "DRB": {"amount": str(drb["amount"]).strip(), "usd": _normalize_usd(drb["usd"])},
-        "WETH": {"amount": str(eth["amount"]).strip(), "usd": _normalize_usd(eth["usd"])},
-        "html": html,
-        "next_data": next_data,
-    }
-
-
-def fetch_historical_fees_claimed_from_grokwallet(html: str, next_data):
+def fetch_historical_fees_claimed(html: str, next_data):
     if next_data is not None:
         usd = _deep_find_first_usd_near_label(next_data, ["historical", "fees", "claimed"])
         if usd:
@@ -194,7 +194,7 @@ def _usd_to_float(s: str) -> float:
     return float(str(s).replace("$", "").replace(",", "").strip())
 
 
-def generate_balance_donut(drb_amount_str: str, drb_usd_str: str, weth_amount_str: str, weth_usd_str: str):
+def generate_balance_donut(drb_amount: str, drb_usd_str: str, weth_amount: str, weth_usd_str: str):
     drb_usd = _usd_to_float(drb_usd_str)
     weth_usd = _usd_to_float(weth_usd_str)
     total = drb_usd + weth_usd
@@ -211,20 +211,47 @@ def generate_balance_donut(drb_amount_str: str, drb_usd_str: str, weth_amount_st
     ax.text(0, -0.18, "Total USD", ha="center", va="center", fontsize=11, color="#666666")
 
     legend_rows = [
-        ("DRB", drb_amount_str, drb_usd_str, DRB_COLOR),
-        ("WETH", weth_amount_str, weth_usd_str, WETH_COLOR),
+        ("DRB", drb_amount, _normalize_usd(drb_usd_str), DRB_COLOR),
+        ("WETH", weth_amount, _normalize_usd(weth_usd_str), WETH_COLOR),
     ]
 
     y0 = -0.10
     line_h = 0.11
     for i, (sym, amt, usd, col) in enumerate(legend_rows):
         y = y0 - i * line_h
-        ax.add_patch(Rectangle((0.10, y - 0.018), 0.030, 0.030, transform=ax.transAxes,
-                               clip_on=False, facecolor=col, edgecolor="none"))
-        ax.text(0.15, y, f"{sym}: {amt}", transform=ax.transAxes, ha="left", va="center",
-                fontsize=12, color="#111111", fontweight="bold")
-        ax.text(0.90, y, f"{usd}", transform=ax.transAxes, ha="right", va="center",
-                fontsize=12, color="#111111", fontweight="bold")
+        ax.add_patch(
+            Rectangle(
+                (0.10, y - 0.018),
+                0.030,
+                0.030,
+                transform=ax.transAxes,
+                clip_on=False,
+                facecolor=col,
+                edgecolor="none",
+            )
+        )
+        ax.text(
+            0.15,
+            y,
+            f"{sym}: {amt}",
+            transform=ax.transAxes,
+            ha="left",
+            va="center",
+            fontsize=12,
+            color="#111111",
+            fontweight="bold",
+        )
+        ax.text(
+            0.90,
+            y,
+            f"{usd}",
+            transform=ax.transAxes,
+            ha="right",
+            va="center",
+            fontsize=12,
+            color="#111111",
+            fontweight="bold",
+        )
 
     buf = BytesIO()
     plt.tight_layout()
@@ -240,34 +267,44 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        data = fetch_balances_from_grokwallet()
+        data = fetch_balances_and_values()
 
         drb_amount = data["DRB"]["amount"]
         drb_usd_str = data["DRB"]["usd"]
         weth_amount = data["WETH"]["amount"]
         weth_usd_str = data["WETH"]["usd"]
 
-        fees_claimed = fetch_historical_fees_claimed_from_grokwallet(data["html"], data["next_data"])
-
         donut = generate_balance_donut(
-            drb_amount_str=drb_amount,
+            drb_amount=drb_amount,
             drb_usd_str=drb_usd_str,
-            weth_amount_str=weth_amount,
+            weth_amount=weth_amount,
             weth_usd_str=weth_usd_str,
         )
 
+        fees_line = ""
+        try:
+            fees_claimed = fetch_historical_fees_claimed(data["html"], data["next_data"])
+            fees_line = f"\n\n{fees_claimed}\nHistorical Fees Claimed"
+        except Exception as e:
+            print("fees scrape error:", repr(e))
+            fees_line = ""
+
         caption = (
             "DebtReliefBot Balance\n"
-            f"$DRB: {drb_amount} ({drb_usd_str})\n"
-            f"$WETH: {weth_amount} ({weth_usd_str})\n\n"
-            f"{fees_claimed}\n"
-            "Historical Fees Claimed"
+            f"$DRB: {drb_amount} ({_normalize_usd(drb_usd_str)})\n"
+            f"$WETH: {weth_amount} ({_normalize_usd(weth_usd_str)})"
+            f"{fees_line}"
         )
 
         await msg.reply_photo(photo=donut, caption=caption)
 
     except Exception as e:
         print("grok_command error:", repr(e))
+        if ADMIN_ID > 0:
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"grok_command error: {repr(e)}")
+            except Exception:
+                pass
         await msg.reply_text("Error fetching balances")
 
 
