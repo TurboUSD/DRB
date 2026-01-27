@@ -214,39 +214,80 @@ def generate_balance_donut(drb_amount: str, drb_usd: float, weth_amount: str, we
     values = [drb_usd, weth_usd]
     colors = [DRB_COLOR, WETH_COLOR]
 
-    fig, ax = plt.subplots(figsize=(6.2, 6.2))
+    fig, ax = plt.subplots(figsize=(6.8, 6.8))
     ax.pie(values, colors=colors, startangle=90, wedgeprops=dict(width=0.35))
     ax.set(aspect="equal")
     ax.set_title("DebtReliefBot Balance", fontsize=18, fontweight="bold", pad=16)
 
-    ax.text(0, 0, f"${total:,.0f}", ha="center", va="center", fontsize=22, fontweight="bold", color="#111111")
-    ax.text(0, -0.18, "Total USD", ha="center", va="center", fontsize=11, color="#666666")
+    ax.text(
+        0, 0,
+        f"${total:,.0f}",
+        ha="center",
+        va="center",
+        fontsize=22,
+        fontweight="bold",
+        color="#111111"
+    )
+    ax.text(
+        0, -0.18,
+        "Total Balance",
+        ha="center",
+        va="center",
+        fontsize=11,
+        color="#666666"
+    )
 
+    # Legend layout: 2 lines per token to avoid overlap
     legend_rows = [
         ("DRB", drb_amount, fmt_usd(drb_usd), DRB_COLOR),
         ("WETH", weth_amount, fmt_usd(weth_usd), WETH_COLOR),
     ]
 
-    y0 = -0.10
-    line_h = 0.11
+    # Push legend further down + widen canvas space
+    y0 = -0.14
+    row_gap = 0.17
+    line_gap = 0.055
+
     for i, (sym, amt, usd_str, col) in enumerate(legend_rows):
-        y = y0 - i * line_h
+        base_y = y0 - i * row_gap
 
         ax.add_patch(
             Rectangle(
-                (0.10, y - 0.018),
-                0.030,
-                0.030,
+                (0.08, base_y - 0.018),
+                0.032,
+                0.032,
                 transform=ax.transAxes,
                 clip_on=False,
                 facecolor=col,
                 edgecolor="none",
             )
         )
-        ax.text(0.15, y, f"{sym}: {amt}", transform=ax.transAxes, ha="left", va="center",
-                fontsize=12, color="#111111", fontweight="bold")
-        ax.text(0.90, y, usd_str, transform=ax.transAxes, ha="right", va="center",
-                fontsize=12, color="#111111", fontweight="bold")
+
+        # Line 1: symbol + amount (left)
+        ax.text(
+            0.14,
+            base_y,
+            f"{sym}: {amt}",
+            transform=ax.transAxes,
+            ha="left",
+            va="center",
+            fontsize=12,
+            color="#111111",
+            fontweight="bold",
+        )
+
+        # Line 2: USD value (left, under amount)
+        ax.text(
+            0.14,
+            base_y - line_gap,
+            usd_str,
+            transform=ax.transAxes,
+            ha="left",
+            va="center",
+            fontsize=12,
+            color="#111111",
+            fontweight="bold",
+        )
 
     buf = BytesIO()
     plt.tight_layout()
@@ -254,6 +295,7 @@ def generate_balance_donut(drb_amount: str, drb_usd: float, weth_amount: str, we
     buf.seek(0)
     plt.close(fig)
     return buf
+
 
 
 async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
