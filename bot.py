@@ -19,13 +19,108 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 GROK_WALLET_URL = "https://thegrokwallet.com/"
+UA_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DebtReliefBot/1.0)"}
 
-UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; DebtReliefBot/1.0)"
-}
+BASE_RPC_URL = "https://mainnet.base.org"
+DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
+
+GROK_WALLET = "0xb1058c959987e3513600eb5b4fd82aeee2a0e4f9"
+DRB_TOKEN = "0x3ec2156d4c0a9cbdab4a016633b7bcf6a8d68ea2"
+WETH_TOKEN = "0x4200000000000000000000000000000000000006"
 
 WETH_COLOR = "#627EEA"
 DRB_COLOR = "#B49C94"
+
+
+def fmt_usd(x: float) -> str:
+    return f"${x:,.0f}"
+
+
+def fmt_amount(amount_int: int, decimals: int, max_decimals: int = 6) -> str:
+    if decimals <= 0:
+        return f"{amount_int:,}"
+    v = amount_int / (10 ** decimals)
+    s = f"{v:,.{max_decimals}f}".rstrip("0").rstrip(".")
+    return s
+
+
+def _rpc_call(method: str, params: list):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = requests.post(BASE_RPC_URL, json=payload, headers=UA_HEADERS, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(str(j["error"]))
+    return j["result"]
+
+
+def _pad32_hex_address(addr: str) -> str:
+    a = addr.lower().replace("0x", "")
+    return a.rjust(64, "0")
+
+
+def _eth_call(to_addr: str, data: str) -> str:
+    return _rpc_call("eth_call", [{"to": to_addr, "data": data}, "latest"])
+
+
+def erc20_decimals(token_addr: str) -> int:
+    out = _eth_call(token_addr, "0x313ce567")
+    return int(out, 16)
+
+
+def erc20_balance_of(token_addr: str, wallet_addr: str) -> int:
+    selector = "0x70a08231"
+    data = selector + _pad32_hex_address(wallet_addr)
+    out = _eth_call(token_addr, data)
+    return int(out, 16)
+
+
+def fetch_price_usd_from_dexscreener(token_addr: str) -> float:
+    r = requests.get(DEXSCREENER_TOKEN_URL + token_addr, headers=UA_HEADERS, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    pairs = j.get("pairs") or []
+
+    best_price = None
+    best_liq = -1.0
+
+    for p in pairs:
+        try:
+            price = float(p.get("priceUsd") or 0.0)
+            liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
+        except Exception:
+            continue
+
+        if price > 0 and liq > best_liq:
+            best_liq = liq
+            best_price = price
+
+    if best_price is None:
+        raise RuntimeError("Dexscreener priceUsd not found")
+
+    return best_price
+
+
+def fetch_balances_and_values():
+    drb_dec = erc20_decimals(DRB_TOKEN)
+    weth_dec = erc20_decimals(WETH_TOKEN)
+
+    drb_bal = erc20_balance_of(DRB_TOKEN, GROK_WALLET)
+    weth_bal = erc20_balance_of(WETH_TOKEN, GROK_WALLET)
+
+    drb_price = fetch_price_usd_from_dexscreener(DRB_TOKEN)
+    weth_price = fetch_price_usd_from_dexscreener(WETH_TOKEN)
+
+    drb_amt = drb_bal / (10 ** drb_dec)
+    weth_amt = weth_bal / (10 ** weth_dec)
+
+    drb_usd = drb_amt * drb_price
+    weth_usd = weth_amt * weth_price
+
+    return {
+        "DRB": {"amount": fmt_amount(drb_bal, drb_dec), "usd": fmt_usd(drb_usd), "usd_float": float(drb_usd)},
+        "WETH": {"amount": fmt_amount(weth_bal, weth_dec), "usd": fmt_usd(weth_usd), "usd_float": float(weth_usd)},
+    }
 
 
 def _parse_next_data(html: str):
@@ -40,92 +135,6 @@ def _parse_next_data(html: str):
         return json.loads(m.group(1))
     except Exception:
         return None
-
-
-def _deep_find_token(obj, symbol: str):
-    symbol = symbol.upper()
-
-    def walk(x):
-        if isinstance(x, dict):
-            sym = x.get("symbol") or x.get("ticker") or x.get("name")
-            if isinstance(sym, str) and sym.upper() == symbol:
-                amount = x.get("amount") or x.get("balance") or x.get("qty")
-                usd = x.get("usd") or x.get("usdValue") or x.get("valueUsd") or x.get("value")
-                if amount is not None and usd is not None:
-                    return {"amount": str(amount), "usd": str(usd)}
-            for v in x.values():
-                r = walk(v)
-                if r:
-                    return r
-        elif isinstance(x, list):
-            for it in x:
-                r = walk(it)
-                if r:
-                    return r
-        return None
-
-    return walk(obj)
-
-
-def _normalize_usd(s: str) -> str:
-    s = str(s).strip()
-    if s.startswith("$"):
-        return s
-    try:
-        x = float(s.replace(",", ""))
-        return f"${x:,.0f}"
-    except Exception:
-        return s
-
-
-def _extract_token_block_from_html(html: str, symbol: str):
-    sym = symbol.upper()
-
-    idx = re.search(rf"\b{re.escape(sym)}\b", html, re.IGNORECASE)
-    if not idx:
-        return None
-
-    start = max(idx.start() - 2200, 0)
-    end = min(idx.start() + 2200, len(html))
-    chunk = html[start:end]
-
-    usd_m = re.search(r"\$[\d\.,]+", chunk)
-    amt_m = re.search(r"(?<!\$)\b\d[\d\.,]*\b", chunk)
-
-    if not usd_m or not amt_m:
-        return None
-
-    return {"amount": amt_m.group(0), "usd": usd_m.group(0)}
-
-
-def fetch_balances_and_values():
-    r = requests.get(GROK_WALLET_URL, headers=UA_HEADERS, timeout=25)
-    r.raise_for_status()
-    html = r.text
-
-    next_data = _parse_next_data(html)
-
-    drb = None
-    eth = None
-
-    if next_data is not None:
-        drb = _deep_find_token(next_data, "DRB")
-        eth = _deep_find_token(next_data, "ETH")
-
-    if not drb:
-        drb = _extract_token_block_from_html(html, "DRB")
-    if not eth:
-        eth = _extract_token_block_from_html(html, "ETH")
-
-    if not drb or not eth:
-        raise RuntimeError("Could not parse DRB or ETH from thegrokwallet.com")
-
-    return {
-        "DRB": {"amount": str(drb["amount"]).strip(), "usd": _normalize_usd(drb["usd"])},
-        "WETH": {"amount": str(eth["amount"]).strip(), "usd": _normalize_usd(eth["usd"])},
-        "html": html,
-        "next_data": next_data,
-    }
 
 
 def _deep_find_first_usd_near_label(obj, label_words):
@@ -173,30 +182,33 @@ def _deep_find_first_usd_near_label(obj, label_words):
     return walk_with_parent(obj)
 
 
-def fetch_historical_fees_claimed(html: str, next_data):
-    if next_data is not None:
-        usd = _deep_find_first_usd_near_label(next_data, ["historical", "fees", "claimed"])
-        if usd:
-            return usd
+def fetch_historical_fees_claimed():
+    try:
+        r = requests.get(GROK_WALLET_URL, headers=UA_HEADERS, timeout=25)
+        r.raise_for_status()
+        html = r.text or ""
 
-    m = re.search(
-        r'(\$[\d\.,]+)\s*[\r\n\s]*Historical\s+Fees\s+Claimed',
-        html,
-        re.IGNORECASE,
-    )
-    if m:
-        return m.group(1).strip()
+        next_data = _parse_next_data(html)
+        if next_data is not None:
+            usd = _deep_find_first_usd_near_label(next_data, ["historical", "fees", "claimed"])
+            if usd:
+                return usd
 
-    raise RuntimeError("Could not parse Historical Fees Claimed")
+        m = re.search(
+            r'(\$[\d\.,]+)\s*[\r\n\s]*Historical\s+Fees\s+Claimed',
+            html,
+            re.IGNORECASE,
+        )
+        if m:
+            return m.group(1).strip()
+
+        return None
+    except Exception as e:
+        print("fees scrape error:", repr(e))
+        return None
 
 
-def _usd_to_float(s: str) -> float:
-    return float(str(s).replace("$", "").replace(",", "").strip())
-
-
-def generate_balance_donut(drb_amount: str, drb_usd_str: str, weth_amount: str, weth_usd_str: str):
-    drb_usd = _usd_to_float(drb_usd_str)
-    weth_usd = _usd_to_float(weth_usd_str)
+def generate_balance_donut(drb_amount: str, drb_usd: float, weth_amount: str, weth_usd: float):
     total = drb_usd + weth_usd
 
     values = [drb_usd, weth_usd]
@@ -211,14 +223,15 @@ def generate_balance_donut(drb_amount: str, drb_usd_str: str, weth_amount: str, 
     ax.text(0, -0.18, "Total USD", ha="center", va="center", fontsize=11, color="#666666")
 
     legend_rows = [
-        ("DRB", drb_amount, _normalize_usd(drb_usd_str), DRB_COLOR),
-        ("WETH", weth_amount, _normalize_usd(weth_usd_str), WETH_COLOR),
+        ("DRB", drb_amount, fmt_usd(drb_usd), DRB_COLOR),
+        ("WETH", weth_amount, fmt_usd(weth_usd), WETH_COLOR),
     ]
 
     y0 = -0.10
     line_h = 0.11
-    for i, (sym, amt, usd, col) in enumerate(legend_rows):
+    for i, (sym, amt, usd_str, col) in enumerate(legend_rows):
         y = y0 - i * line_h
+
         ax.add_patch(
             Rectangle(
                 (0.10, y - 0.018),
@@ -230,28 +243,10 @@ def generate_balance_donut(drb_amount: str, drb_usd_str: str, weth_amount: str, 
                 edgecolor="none",
             )
         )
-        ax.text(
-            0.15,
-            y,
-            f"{sym}: {amt}",
-            transform=ax.transAxes,
-            ha="left",
-            va="center",
-            fontsize=12,
-            color="#111111",
-            fontweight="bold",
-        )
-        ax.text(
-            0.90,
-            y,
-            f"{usd}",
-            transform=ax.transAxes,
-            ha="right",
-            va="center",
-            fontsize=12,
-            color="#111111",
-            fontweight="bold",
-        )
+        ax.text(0.15, y, f"{sym}: {amt}", transform=ax.transAxes, ha="left", va="center",
+                fontsize=12, color="#111111", fontweight="bold")
+        ax.text(0.90, y, usd_str, transform=ax.transAxes, ha="right", va="center",
+                fontsize=12, color="#111111", fontweight="bold")
 
     buf = BytesIO()
     plt.tight_layout()
@@ -267,42 +262,43 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        data = fetch_balances_and_values()
+        b = fetch_balances_and_values()
 
-        drb_amount = data["DRB"]["amount"]
-        drb_usd_str = data["DRB"]["usd"]
-        weth_amount = data["WETH"]["amount"]
-        weth_usd_str = data["WETH"]["usd"]
+        drb_amount = b["DRB"]["amount"]
+        drb_usd_val = b["DRB"]["usd_float"]
+        drb_usd_str = b["DRB"]["usd"]
+
+        weth_amount = b["WETH"]["amount"]
+        weth_usd_val = b["WETH"]["usd_float"]
+        weth_usd_str = b["WETH"]["usd"]
 
         donut = generate_balance_donut(
             drb_amount=drb_amount,
-            drb_usd_str=drb_usd_str,
+            drb_usd=drb_usd_val,
             weth_amount=weth_amount,
-            weth_usd_str=weth_usd_str,
+            weth_usd=weth_usd_val,
         )
 
-        fees_line = ""
-        try:
-            fees_claimed = fetch_historical_fees_claimed(data["html"], data["next_data"])
-            fees_line = f"\n\n{fees_claimed}\nHistorical Fees Claimed"
-        except Exception as e:
-            print("fees scrape error:", repr(e))
-            fees_line = ""
+        fees = fetch_historical_fees_claimed()
+        fees_block = ""
+        if fees:
+            fees_block = f"\n\n{fees}\nHistorical Fees Claimed"
 
         caption = (
             "DebtReliefBot Balance\n"
-            f"$DRB: {drb_amount} ({_normalize_usd(drb_usd_str)})\n"
-            f"$WETH: {weth_amount} ({_normalize_usd(weth_usd_str)})"
-            f"{fees_line}"
+            f"$DRB: {drb_amount} ({drb_usd_str})\n"
+            f"$WETH: {weth_amount} ({weth_usd_str})"
+            f"{fees_block}"
         )
 
         await msg.reply_photo(photo=donut, caption=caption)
 
     except Exception as e:
-        print("grok_command error:", repr(e))
+        err = repr(e)
+        print("grok_command error:", err)
         if ADMIN_ID > 0:
             try:
-                await context.bot.send_message(chat_id=ADMIN_ID, text=f"grok_command error: {repr(e)}")
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"grok_command error: {err}")
             except Exception:
                 pass
         await msg.reply_text("Error fetching balances")
