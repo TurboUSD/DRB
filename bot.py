@@ -1,6 +1,12 @@
+import os
+import requests
 import json
 import re
-import requests
+import matplotlib.pyplot as plt
+from io import BytesIO
+
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 GROK_WALLET_URL = "https://thegrokwallet.com/"
 
