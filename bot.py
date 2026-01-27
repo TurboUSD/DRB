@@ -211,10 +211,14 @@ def fetch_historical_fees_claimed():
 def generate_balance_donut(drb_amount: str, drb_usd: float, weth_amount: str, weth_usd: float):
     total = drb_usd + weth_usd
 
+    # 🔧 format amounts to avoid overlap
+    drb_amount_fmt = f"{float(drb_amount.replace(',', '')):,.0f}"
+    weth_amount_fmt = f"{float(weth_amount.replace(',', '')):,.2f}"
+
     values = [drb_usd, weth_usd]
     colors = [DRB_COLOR, WETH_COLOR]
 
-    fig, ax = plt.subplots(figsize=(6.8, 6.8))
+    fig, ax = plt.subplots(figsize=(6.6, 6.6))
     ax.pie(values, colors=colors, startangle=90, wedgeprops=dict(width=0.35))
     ax.set(aspect="equal")
     ax.set_title("DebtReliefBot Balance", fontsize=18, fontweight="bold", pad=16)
@@ -237,25 +241,22 @@ def generate_balance_donut(drb_amount: str, drb_usd: float, weth_amount: str, we
         color="#666666"
     )
 
-    # Legend layout: 2 lines per token to avoid overlap
     legend_rows = [
-        ("DRB", drb_amount, fmt_usd(drb_usd), DRB_COLOR),
-        ("WETH", weth_amount, fmt_usd(weth_usd), WETH_COLOR),
+        ("DRB", drb_amount_fmt, fmt_usd(drb_usd), DRB_COLOR),
+        ("WETH", weth_amount_fmt, fmt_usd(weth_usd), WETH_COLOR),
     ]
 
-    # Push legend further down + widen canvas space
-    y0 = -0.14
-    row_gap = 0.17
-    line_gap = 0.055
+    y0 = -0.12
+    line_h = 0.12
 
     for i, (sym, amt, usd_str, col) in enumerate(legend_rows):
-        base_y = y0 - i * row_gap
+        y = y0 - i * line_h
 
         ax.add_patch(
             Rectangle(
-                (0.08, base_y - 0.018),
-                0.032,
-                0.032,
+                (0.10, y - 0.018),
+                0.030,
+                0.030,
                 transform=ax.transAxes,
                 clip_on=False,
                 facecolor=col,
@@ -263,10 +264,9 @@ def generate_balance_donut(drb_amount: str, drb_usd: float, weth_amount: str, we
             )
         )
 
-        # Line 1: symbol + amount (left)
         ax.text(
-            0.14,
-            base_y,
+            0.15,
+            y,
             f"{sym}: {amt}",
             transform=ax.transAxes,
             ha="left",
@@ -276,13 +276,12 @@ def generate_balance_donut(drb_amount: str, drb_usd: float, weth_amount: str, we
             fontweight="bold",
         )
 
-        # Line 2: USD value (left, under amount)
         ax.text(
-            0.14,
-            base_y - line_gap,
+            0.90,
+            y,
             usd_str,
             transform=ax.transAxes,
-            ha="left",
+            ha="right",
             va="center",
             fontsize=12,
             color="#111111",
@@ -295,6 +294,7 @@ def generate_balance_donut(drb_amount: str, drb_usd: float, weth_amount: str, we
     buf.seek(0)
     plt.close(fig)
     return buf
+
 
 
 
@@ -326,10 +326,18 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if fees:
             fees_block = f"\n\n{fees}\nHistorical Fees Claimed"
 
+        # 🔧 format amounts (DRB no decimals, WETH 2 decimals)
+        drb_amount_fmt = f"{float(drb_amount.replace(',', '')):,.0f}"
+        weth_amount_fmt = f"{float(weth_amount.replace(',', '')):,.2f}"
+
         caption = (
-            "DebtReliefBot Balance\n"
-            f"$DRB: {drb_amount} ({drb_usd_str})\n"
-            f"$WETH: {weth_amount} ({weth_usd_str})"
+            "DebtReliefBot Balance\n\n"
+            "DRB\n"
+            f"{drb_amount_fmt}\n"
+            f"{drb_usd_str}\n\n"
+            "WETH\n"
+            f"{weth_amount_fmt}\n"
+            f"{weth_usd_str}"
             f"{fees_block}"
         )
 
@@ -340,10 +348,14 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("grok_command error:", err)
         if ADMIN_ID > 0:
             try:
-                await context.bot.send_message(chat_id=ADMIN_ID, text=f"grok_command error: {err}")
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"grok_command error: {err}"
+                )
             except Exception:
                 pass
         await msg.reply_text("Error fetching balances")
+
 
 
 async def on_startup(app):
