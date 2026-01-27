@@ -1,134 +1,115 @@
-# main.py
 import os
-import re
-import json
 import requests
-from bs4 import BeautifulSoup
-
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-GROK_WALLET_URL = "https://thegrokwallet.com/"
+BASE_RPC_URL = "https://mainnet.base.org"
+
+GROK_WALLET = "0xb1058c959987e3513600eb5b4fd82aeee2a0e4f9"
+
+DRB_TOKEN = "0x3ec2156d4c0a9cbdab4a016633b7bcf6a8d68ea2"
+WETH_TOKEN = "0x4200000000000000000000000000000000000006"
+
+DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; DebtReliefBot/1.0; +https://thegrokwallet.com/)"
+    "User-Agent": "Mozilla/5.0 (compatible; DebtReliefBot/1.0)"
 }
 
 
-def _clean_number(s: str) -> str:
-    return re.sub(r"[^\d\.\-]", "", s)
+def _rpc_call(method: str, params: list):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = requests.post(BASE_RPC_URL, json=payload, headers=UA_HEADERS, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(str(j["error"]))
+    return j["result"]
 
 
-def _fmt_amount(s: str) -> str:
-    try:
-        x = float(_clean_number(s))
-    except Exception:
-        return s.strip()
-    if abs(x) >= 1:
-        return f"{x:,.4f}".rstrip("0").rstrip(".")
-    return f"{x:.8f}".rstrip("0").rstrip(".")
+def _pad32_hex_address(addr: str) -> str:
+    a = addr.lower().replace("0x", "")
+    return a.rjust(64, "0")
 
 
-def _fmt_usd(s: str) -> str:
-    try:
-        x = float(_clean_number(s))
-    except Exception:
-        return s.strip()
+def _eth_call(to_addr: str, data: str) -> str:
+    return _rpc_call("eth_call", [{"to": to_addr, "data": data}, "latest"])
+
+
+def erc20_decimals(token_addr: str) -> int:
+    data = "0x313ce567"
+    out = _eth_call(token_addr, data)
+    return int(out, 16)
+
+
+def erc20_balance_of(token_addr: str, wallet_addr: str) -> int:
+    selector = "0x70a08231"
+    data = selector + _pad32_hex_address(wallet_addr)
+    out = _eth_call(token_addr, data)
+    return int(out, 16)
+
+
+def fetch_price_usd(token_addr: str) -> float:
+    r = requests.get(
+        DEXSCREENER_TOKEN_URL + token_addr,
+        headers=UA_HEADERS,
+        timeout=20
+    )
+    r.raise_for_status()
+    j = r.json()
+    pairs = j.get("pairs") or []
+    best = None
+    best_liq = -1.0
+
+    for p in pairs:
+        try:
+            price = float(p.get("priceUsd") or 0.0)
+            liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
+        except Exception:
+            continue
+        if price > 0 and liq > best_liq:
+            best_liq = liq
+            best = price
+
+    if best is None:
+        raise RuntimeError("No priceUsd found")
+    return best
+
+
+def fmt_amount(amount_int: int, decimals: int, max_decimals: int = 6) -> str:
+    if decimals <= 0:
+        return f"{amount_int:,}"
+    value = amount_int / (10 ** decimals)
+    s = f"{value:,.{max_decimals}f}".rstrip("0").rstrip(".")
+    return s
+
+
+def fmt_usd(x: float) -> str:
     return f"${x:,.0f}"
 
 
-def _deep_find_token(data, symbol: str):
-    if isinstance(data, dict):
-        sym = data.get("symbol") or data.get("ticker") or data.get("name")
-        if isinstance(sym, str) and sym.upper() == symbol.upper():
-            amount = data.get("amount") or data.get("balance") or data.get("qty")
-            usd = data.get("usd") or data.get("usdValue") or data.get("valueUsd") or data.get("value")
-            if amount is not None and usd is not None:
-                return {"amount": str(amount), "usd": str(usd)}
-        for v in data.values():
-            r = _deep_find_token(v, symbol)
-            if r:
-                return r
-    elif isinstance(data, list):
-        for it in data:
-            r = _deep_find_token(it, symbol)
-            if r:
-                return r
-    return None
+def fetch_balances_and_values():
+    drb_dec = erc20_decimals(DRB_TOKEN)
+    weth_dec = erc20_decimals(WETH_TOKEN)
 
+    drb_bal = erc20_balance_of(DRB_TOKEN, GROK_WALLET)
+    weth_bal = erc20_balance_of(WETH_TOKEN, GROK_WALLET)
 
-def _parse_next_data(html: str):
-    m = re.search(r'id="__NEXT_DATA__"\s*type="application\/json"\s*>(.*?)<\/script>', html, re.S)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(1))
-    except Exception:
-        return None
+    drb_price = fetch_price_usd(DRB_TOKEN)
+    weth_price = fetch_price_usd(WETH_TOKEN)
 
+    drb_amt = drb_bal / (10 ** drb_dec)
+    weth_amt = weth_bal / (10 ** weth_dec)
 
-def _parse_from_html_fallback(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-    def find_block(symbol: str):
-        sym = symbol.upper()
-        for i, ln in enumerate(lines):
-            if ln.upper() == sym:
-                amt = None
-                usd = None
-                for j in range(i + 1, min(i + 12, len(lines))):
-                    v = lines[j]
-                    if amt is None and re.search(r"\d", v) and not v.startswith("$"):
-                        amt = v
-                        continue
-                    if usd is None and v.startswith("$") and re.search(r"\d", v):
-                        usd = v
-                        break
-                if amt and usd:
-                    return {"amount": amt, "usd": usd}
-        return None
-
-    drb = find_block("DRB")
-    eth = find_block("ETH")
-    return {"DRB": drb, "ETH": eth}
-
-
-def fetch_grok_wallet_balances():
-    r = requests.get(GROK_WALLET_URL, headers=UA_HEADERS, timeout=20)
-    r.raise_for_status()
-    html = r.text
-
-    next_data = _parse_next_data(html)
-    drb = None
-    eth = None
-
-    if next_data is not None:
-        drb = _deep_find_token(next_data, "DRB")
-        eth = _deep_find_token(next_data, "ETH")
-
-    if not drb or not eth:
-        fb = _parse_from_html_fallback(html)
-        if not drb:
-            drb = fb.get("DRB")
-        if not eth:
-            eth = fb.get("ETH")
-
-    if not drb or not eth:
-        raise RuntimeError("Could not parse balances from thegrokwallet.com")
-
-    drb_amount = _fmt_amount(drb["amount"])
-    drb_usd = _fmt_usd(drb["usd"])
-    eth_amount = _fmt_amount(eth["amount"])
-    eth_usd = _fmt_usd(eth["usd"])
+    drb_usd = drb_amt * drb_price
+    weth_usd = weth_amt * weth_price
 
     return {
-        "DRB": {"amount": drb_amount, "usd": drb_usd},
-        "WETH": {"amount": eth_amount, "usd": eth_usd},
+        "DRB": {"amount": fmt_amount(drb_bal, drb_dec), "usd": fmt_usd(drb_usd)},
+        "WETH": {"amount": fmt_amount(weth_bal, weth_dec), "usd": fmt_usd(weth_usd)},
     }
 
 
@@ -138,7 +119,7 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        b = fetch_grok_wallet_balances()
+        b = fetch_balances_and_values()
         text = (
             "DebtReliefBot Balance\n"
             f"$DRB: {b['DRB']['amount']} ({b['DRB']['usd']})\n"
@@ -146,7 +127,7 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await msg.reply_text(text)
     except Exception:
-        await msg.reply_text("Error fetching balances from thegrokwallet.com")
+        await msg.reply_text("Error fetching balances")
 
 
 async def on_startup(app):
