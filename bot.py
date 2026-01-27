@@ -147,3 +147,20 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception:
         await msg.reply_text("Error fetching balances")
+
+
+def main():
+    app = (
+        ApplicationBuilder()
+        .token(os.environ["BOT_TOKEN"])
+        .build()
+    )
+
+    app.add_handler(CommandHandler("grok", grok_command))
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
+
