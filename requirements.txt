@@ -1,0 +1,4 @@
+requests
+matplotlib
+python-telegram-bot==20.0
+eth-abi>=5.0.0
