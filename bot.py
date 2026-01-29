@@ -3,6 +3,7 @@ import os
 import re
 import json
 import requests
+import math
 
 import matplotlib
 matplotlib.use("Agg")
@@ -96,34 +97,7 @@ def fetch_price_usd(token: str) -> float:
 
 # ================= BALANCES =================
 
-def fetch_balances_and_values():
-    drb_dec = erc20_decimals(DRB_TOKEN)
-    weth_dec = erc20_decimals(WETH_TOKEN)
-
-    drb_raw = erc20_balance_of(DRB_TOKEN, GROK_WALLET)
-    weth_raw = erc20_balance_of(WETH_TOKEN, GROK_WALLET)
-
-    drb_amt = drb_raw / 10 ** drb_dec
-    weth_amt = weth_raw / 10 ** weth_dec
-
-    drb_price = fetch_price_usd(DRB_TOKEN)
-    weth_price = fetch_price_usd(WETH_TOKEN)
-
-    drb_usd = drb_amt * drb_price
-    weth_usd = weth_amt * weth_price
-
-    return {
-        "DRB": {
-            "amount": f"{drb_amt:,.0f}",
-            "usd": fmt_usd(drb_usd),
-            "usd_float": drb_usd,
-        },
-        "WETH": {
-            "amount": f"{weth_amt:,.2f}",
-            "usd": fmt_usd(weth_usd),
-            "usd_float": weth_usd,
-        },
-    }
+def fetch_balances_and_values
 
 
 # ================= FEES =================
@@ -184,13 +158,24 @@ def fetch_historical_fees_claimed():
 
 # ================= DONUT =================
 
-def generate_balance_donut(drb_usd: float, weth_usd: float):
+def generate_balance_donut(
+    drb_usd: float,
+    weth_usd: float,
+    drb_amount_float: float,
+    weth_amount_float: float,
+):
     total = drb_usd + weth_usd
 
+    drb_amount_label = fmt_compact_b(drb_amount_float)   # 2.93B
+    weth_amount_label = f"{weth_amount_float:,.2f}"      # 121.80
+
+    values = [drb_usd, weth_usd]
+    colors = [DRB_COLOR, WETH_COLOR]
+
     fig, ax = plt.subplots(figsize=(6.6, 6.6))
-    ax.pie(
-        [drb_usd, weth_usd],
-        colors=[DRB_COLOR, WETH_COLOR],
+    wedges, _ = ax.pie(
+        values,
+        colors=colors,
         startangle=90,
         wedgeprops=dict(width=0.35),
     )
@@ -200,12 +185,30 @@ def generate_balance_donut(drb_usd: float, weth_usd: float):
     ax.text(0, 0, f"${total:,.0f}", ha="center", va="center", fontsize=22, fontweight="bold")
     ax.text(0, -0.18, "Total Balance", ha="center", va="center", fontsize=11, color="#666")
 
+    # Put token amounts inside each ring segment
+    labels = [f"DRB\n{drb_amount_label}", f"WETH\n{weth_amount_label}"]
+    for w, t in zip(wedges, labels):
+        ang = (w.theta1 + w.theta2) / 2.0
+        r = 0.82  # radius for text placement (inside the ring)
+        x = r * (math.cos(math.radians(ang)))
+        y = r * (math.sin(math.radians(ang)))
+        ax.text(
+            x, y,
+            t,
+            ha="center",
+            va="center",
+            fontsize=12,
+            fontweight="bold",
+            color="#111111",
+        )
+
     buf = BytesIO()
     plt.tight_layout()
     plt.savefig(buf, format="png", dpi=170, bbox_inches="tight")
     buf.seek(0)
     plt.close(fig)
     return buf
+
 
 
 # ================= TABLE CAPTION =================
@@ -254,15 +257,19 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         b = fetch_balances_and_values()
 
+        # Update the call in grok_command to pass the amounts too
         donut = generate_balance_donut(
             b["DRB"]["usd_float"],
             b["WETH"]["usd_float"],
+            b["DRB"]["amount_float"],
+            b["WETH"]["amount_float"],
         )
+
 
         fees = fetch_historical_fees_claimed()
 
         caption = make_balance_table_caption(
-            drb_amount_float=b["DRB"]["usd_float"] / (b["DRB"]["usd_float"] / b["DRB"]["usd_float"]),  # 👈 no tocar fetch
+            drb_amount_float=b["DRB"]["amount_float"],
             drb_usd_str=b["DRB"]["usd"],
             weth_amount_str=b["WETH"]["amount"],
             weth_usd_str=b["WETH"]["usd"],
@@ -280,6 +287,7 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         await msg.reply_text("Error fetching balances")
+
 
 
 # ================= BOOT =================
