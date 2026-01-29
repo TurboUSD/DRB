@@ -39,6 +39,10 @@ WETH_COLOR = "#627EEA"
 def fmt_usd(x: float) -> str:
     return f"${x:,.0f}"
 
+def fmt_compact_b(n: float) -> str:
+    return f"{n / 1_000_000_000:.2f}B"
+
+
 
 def _rpc_call(method: str, params: list):
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -206,23 +210,38 @@ def generate_balance_donut(drb_usd: float, weth_usd: float):
 
 # ================= TABLE CAPTION =================
 
-def make_balance_table_caption(drb_amt, drb_usd, weth_amt, weth_usd, fees):
+def make_balance_table_caption(
+    drb_amount_float: float,
+    drb_usd_str: str,
+    weth_amount_str: str,
+    weth_usd_str: str,
+    fees: str | None,
+) -> str:
+    drb_compact = fmt_compact_b(drb_amount_float)
+
     rows = [
         ("Token", "Amount", "USD"),
-        ("DRB", drb_amt, drb_usd),
-        ("WETH", weth_amt, weth_usd),
+        ("-----", "------", "---"),
+        ("DRB", drb_compact, drb_usd_str),
+        ("WETH", weth_amount_str, weth_usd_str),
     ]
 
     c1 = max(len(r[0]) for r in rows)
     c2 = max(len(r[1]) for r in rows)
     c3 = max(len(r[2]) for r in rows)
 
-    lines = [f"{a:<{c1}}  {b:>{c2}}  {c:>{c3}}" for a, b, c in rows]
+    lines = [
+        f"{a:<{c1}}  {b:>{c2}}  {c:>{c3}}"
+        for a, b, c in rows
+    ]
 
-    caption = "DebtReliefBot Balance\n<pre>" + "\n".join(lines) + "</pre>"
+    caption = "<pre>" + "\n".join(lines) + "</pre>"
+
     if fees:
         caption += f"\n\n{fees}\nHistorical Fees Claimed"
+
     return caption
+
 
 
 # ================= COMMAND =================
@@ -243,11 +262,11 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fees = fetch_historical_fees_claimed()
 
         caption = make_balance_table_caption(
-            b["DRB"]["amount"],
-            b["DRB"]["usd"],
-            b["WETH"]["amount"],
-            b["WETH"]["usd"],
-            fees,
+            drb_amount_float=b["DRB"]["usd_float"] / (b["DRB"]["usd_float"] / b["DRB"]["usd_float"]),  # 👈 no tocar fetch
+            drb_usd_str=b["DRB"]["usd"],
+            weth_amount_str=b["WETH"]["amount"],
+            weth_usd_str=b["WETH"]["usd"],
+            fees=fees,
         )
 
         await msg.reply_photo(photo=donut, caption=caption, parse_mode="HTML")
