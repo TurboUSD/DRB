@@ -97,7 +97,37 @@ def fetch_price_usd(token: str) -> float:
 
 # ================= BALANCES =================
 
-def fetch_balances_and_values
+def fetch_balances_and_values():
+    drb_dec = erc20_decimals(DRB_TOKEN)
+    weth_dec = erc20_decimals(WETH_TOKEN)
+
+    drb_raw = erc20_balance_of(DRB_TOKEN, GROK_WALLET)
+    weth_raw = erc20_balance_of(WETH_TOKEN, GROK_WALLET)
+
+    drb_amt = drb_raw / 10 ** drb_dec
+    weth_amt = weth_raw / 10 ** weth_dec
+
+    drb_price = fetch_price_usd(DRB_TOKEN)
+    weth_price = fetch_price_usd(WETH_TOKEN)
+
+    drb_usd = drb_amt * drb_price
+    weth_usd = weth_amt * weth_price
+
+    return {
+        "DRB": {
+            "amount": f"{drb_amt:,.0f}",
+            "amount_float": float(drb_amt),
+            "usd": fmt_usd(drb_usd),
+            "usd_float": float(drb_usd),
+        },
+        "WETH": {
+            "amount": f"{weth_amt:,.2f}",
+            "amount_float": float(weth_amt),
+            "usd": fmt_usd(weth_usd),
+            "usd_float": float(weth_usd),
+        },
+    }
+
 
 
 # ================= FEES =================
