@@ -9,10 +9,9 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
 from io import BytesIO
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -36,9 +35,13 @@ WETH_TOKEN = "0x4200000000000000000000000000000000000006"
 DRB_COLOR = "#B49C94"
 WETH_COLOR = "#627EEA"
 
-# Put your provided background image here
-# Create this file in your repo: assets/grok_wallet_bg.png
+# Put the background image here
+# Save your starfield image as: assets/grok_wallet_bg.png
 GROK_BG_PATH = "assets/grok_wallet_bg.png"
+
+# Grok web card aspect
+CARD_W = 896
+CARD_H = 658
 
 
 # ================= HELPERS =================
@@ -99,6 +102,87 @@ def fetch_price_usd(token: str) -> float:
         raise RuntimeError("No priceUsd found")
 
     return best_price
+
+
+def _try_font(paths: list[str], size: int) -> ImageFont.FreeTypeFont:
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _load_fonts():
+    bold_candidates = [
+        "assets/font_bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    regular_candidates = [
+        "assets/font_regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+
+    return {
+        "title": _try_font(bold_candidates, 56),
+        "big": _try_font(bold_candidates, 86),
+        "mid": _try_font(regular_candidates, 28),
+        "box_sym": _try_font(bold_candidates, 34),
+        "box_amt": _try_font(bold_candidates, 44),
+        "box_usd": _try_font(regular_candidates, 30),
+    }
+
+
+def _text_center(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, y: int, width: int, fill):
+    try:
+        tw = draw.textlength(text, font=font)
+        x = int((width - tw) / 2)
+    except Exception:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        x = int((width - (bbox[2] - bbox[0])) / 2)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def _draw_text_shadow(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font: ImageFont.ImageFont, fill, shadow=(0, 0, 0, 140), offset=(2, 2)):
+    x, y = xy
+    draw.text((x + offset[0], y + offset[1]), text, font=font, fill=shadow)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def _draw_center_shadow(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, y: int, width: int, fill, shadow=(0, 0, 0, 140), offset=(2, 2)):
+    try:
+        tw = draw.textlength(text, font=font)
+        x = int((width - tw) / 2)
+    except Exception:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        x = int((width - (bbox[2] - bbox[0])) / 2)
+
+    _draw_text_shadow(draw, (x, y), text, font, fill=fill, shadow=shadow, offset=offset)
+
+
+def _rounded_mask(size: tuple[int, int], radius: int) -> Image.Image:
+    m = Image.new("L", size, 0)
+    d = ImageDraw.Draw(m)
+    d.rounded_rectangle((0, 0, size[0], size[1]), radius=radius, fill=255)
+    return m
+
+
+def _glass_panel(bg: Image.Image, rect: tuple[int, int, int, int], radius: int, tint=(20, 18, 40, 130), blur_radius=14) -> Image.Image:
+    x1, y1, x2, y2 = rect
+    crop = bg.crop((x1, y1, x2, y2)).filter(ImageFilter.GaussianBlur(blur_radius)).convert("RGBA")
+    overlay = Image.new("RGBA", (x2 - x1, y2 - y1), tint)
+    crop = Image.alpha_composite(crop, overlay)
+
+    mask = _rounded_mask((x2 - x1, y2 - y1), radius)
+    panel = Image.new("RGBA", (x2 - x1, y2 - y1), (0, 0, 0, 0))
+    panel.paste(crop, (0, 0), mask)
+
+    edge = Image.new("RGBA", (x2 - x1, y2 - y1), (255, 255, 255, 35))
+    border = Image.new("RGBA", (x2 - x1, y2 - y1), (0, 0, 0, 0))
+    border.paste(edge, (0, 0), mask)
+
+    return Image.alpha_composite(panel, border)
 
 
 # ================= BALANCES =================
@@ -191,7 +275,7 @@ def fetch_historical_fees_claimed():
     return None
 
 
-# ================= DONUT IMAGE =================
+# ================= DONUT IMAGE (existing /grok) =================
 
 def generate_balance_donut(
     drb_usd: float,
@@ -244,8 +328,6 @@ def generate_balance_donut(
     return buf
 
 
-# ================= TABLE CAPTION =================
-
 def make_balance_table_caption(
     drb_amount_float: float,
     drb_usd_str: str,
@@ -275,97 +357,74 @@ def make_balance_table_caption(
     return caption
 
 
-# ================= GROK2 STYLE CARD (BACKGROUND) =================
+# ================= GROK2 STYLE CARD (same as web layout) =================
 
-def _try_font(paths: list[str], size: int):
-    for p in paths:
-        try:
-            return ImageFont.truetype(p, size=size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-
-def _load_fonts():
-    bold_candidates = [
-        "assets/font_bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    regular_candidates = [
-        "assets/font_regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-
-    return {
-        "title": _try_font(bold_candidates, 60),
-        "big": _try_font(bold_candidates, 78),
-        "mid": _try_font(regular_candidates, 30),
-        "box_title": _try_font(bold_candidates, 34),
-        "box_amt": _try_font(bold_candidates, 44),
-        "box_usd": _try_font(regular_candidates, 30),
-    }
-
-
-def _text_center(draw: ImageDraw.ImageDraw, text: str, font, y: int, width: int, fill):
-    try:
-        tw = draw.textlength(text, font=font)
-        x = int((width - tw) / 2)
-    except Exception:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        x = int((width - (bbox[2] - bbox[0])) / 2)
-    draw.text((x, y), text, font=font, fill=fill)
-
-
-def generate_grok_wallet_card_style(
+def generate_grok_web_style_card(
     total_usd: float,
     weth_amount_float: float,
     weth_usd: float,
     drb_amount_float: float,
     drb_usd: float,
 ):
-    img = Image.open(GROK_BG_PATH).convert("RGBA")
-    draw = ImageDraw.Draw(img)
-    W, H = img.size
+    bg = Image.open(GROK_BG_PATH).convert("RGBA")
+    bg = bg.resize((CARD_W, CARD_H), Image.LANCZOS)
 
     fonts = _load_fonts()
 
     WHITE = (255, 255, 255, 255)
-    GREY = (190, 190, 210, 255)
-    SOFT_WHITE = (235, 235, 245, 255)
+    MUTED = (175, 175, 200, 255)
+    SOFT = (230, 230, 245, 255)
 
-    total_str = f"${total_usd:,.0f}"
+    canvas = bg.copy()
 
+    # Outer glass card
+    outer = (24, 24, CARD_W - 24, CARD_H - 24)
+    outer_panel = _glass_panel(canvas, outer, radius=34, tint=(12, 10, 30, 145), blur_radius=18)
+    canvas.alpha_composite(outer_panel, (outer[0], outer[1]))
+
+    # Inner separator line
+    d = ImageDraw.Draw(canvas)
+    d.line((outer[0] + 28, 500, outer[2] - 28, 500), fill=(255, 255, 255, 40), width=1)
+
+    # Header text (no auth, no address, no 24h, no footer)
+    _draw_center_shadow(d, "GROK WALLET", fonts["title"], y=70, width=CARD_W, fill=WHITE, shadow=(0, 0, 0, 120))
+    _draw_center_shadow(d, f"${total_usd:,.0f}", fonts["big"], y=160, width=CARD_W, fill=WHITE, shadow=(0, 0, 0, 120))
+    _text_center(d, "Live Balance", fonts["mid"], y=270, width=CARD_W, fill=MUTED)
+
+    # Two inner glass boxes
+    box_y1, box_y2 = 330, 470
+    left = (outer[0] + 28, box_y1, (CARD_W // 2) - 14, box_y2)
+    right = ((CARD_W // 2) + 14, box_y1, outer[2] - 28, box_y2)
+
+    left_panel = _glass_panel(canvas, left, radius=22, tint=(18, 18, 38, 150), blur_radius=16)
+    right_panel = _glass_panel(canvas, right, radius=22, tint=(18, 18, 38, 150), blur_radius=16)
+
+    canvas.alpha_composite(left_panel, (left[0], left[1]))
+    canvas.alpha_composite(right_panel, (right[0], right[1]))
+
+    d = ImageDraw.Draw(canvas)
+
+    # Values formatting
     eth_amt_str = f"{weth_amount_float:,.2f}"
     eth_usd_str = fmt_usd(weth_usd)
 
     drb_amt_str = fmt_compact_b(drb_amount_float)
     drb_usd_str = fmt_usd(drb_usd)
 
-    # Scale coordinates from the provided reference (896 x 658)
-    base_w, base_h = 896.0, 658.0
-    sx, sy = W / base_w, H / base_h
+    # Left box content (ETH)
+    lx, ly = left[0], left[1]
+    d.text((lx + 34, ly + 34), "ETH", font=fonts["box_sym"], fill=SOFT)
+    d.text((lx + 34, ly + 78), eth_amt_str, font=fonts["box_amt"], fill=WHITE)
+    d.text((lx + 34, ly + 122), eth_usd_str, font=fonts["box_usd"], fill=MUTED)
 
-    def px(x): return int(x * sx)
-    def py(y): return int(y * sy)
-
-    # Header (no "AUTH'D BY...", no address, no 24h)
-    _text_center(draw, "GROK WALLET", fonts["title"], y=py(60), width=W, fill=WHITE)
-    _text_center(draw, total_str, fonts["big"], y=py(165), width=W, fill=WHITE)
-    _text_center(draw, "Live Balance", fonts["mid"], y=py(265), width=W, fill=GREY)
-
-    # Left box (ETH)
-    draw.text((px(145), py(398)), "ETH", font=fonts["box_title"], fill=SOFT_WHITE)
-    draw.text((px(205), py(460)), eth_amt_str, font=fonts["box_amt"], fill=WHITE)
-    draw.text((px(225), py(520)), eth_usd_str, font=fonts["box_usd"], fill=GREY)
-
-    # Right box (DRB)
-    draw.text((px(530), py(398)), "DRB", font=fonts["box_title"], fill=SOFT_WHITE)
-    draw.text((px(560), py(460)), drb_amt_str, font=fonts["box_amt"], fill=WHITE)
-    draw.text((px(585), py(520)), drb_usd_str, font=fonts["box_usd"], fill=GREY)
+    # Right box content (DRB)
+    rx, ry = right[0], right[1]
+    d.text((rx + 34, ry + 34), "DRB", font=fonts["box_sym"], fill=SOFT)
+    d.text((rx + 34, ry + 78), drb_amt_str, font=fonts["box_amt"], fill=WHITE)
+    d.text((rx + 34, ry + 122), drb_usd_str, font=fonts["box_usd"], fill=MUTED)
 
     buf = BytesIO()
-    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    canvas.convert("RGB").save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
 
@@ -419,7 +478,7 @@ async def grok2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b = fetch_balances_and_values()
         total_usd = b["DRB"]["usd_float"] + b["WETH"]["usd_float"]
 
-        card = generate_grok_wallet_card_style(
+        card = generate_grok_web_style_card(
             total_usd=total_usd,
             weth_amount_float=b["WETH"]["amount_float"],
             weth_usd=b["WETH"]["usd_float"],
