@@ -362,7 +362,7 @@ def generate_balance_donut(
         wedgeprops=dict(width=0.35),
     )
     ax.set(aspect="equal")
-    ax.set_title("GROK WALLET", fontsize=24, fontweight="bold", pad=24)
+    ax.set_title("GROK WALLET", fontsize=24, fontweight="bold", pad=6)
 
     ax.text(0, 0, f"${total:,.0f}", ha="center", va="center", fontsize=30, fontweight="bold")
     ax.text(0, -0.20, "Total Balance", ha="center", va="center", fontsize=11, color="#666")
@@ -385,8 +385,8 @@ def generate_balance_donut(
         )
 
     buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=170, bbox_inches="tight")
+    fig.subplots_adjust(top=0.82)  
+    plt.savefig(buf, format="png", dpi=170)
     buf.seek(0)
     plt.close(fig)
     return buf
