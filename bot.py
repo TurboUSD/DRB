@@ -32,8 +32,8 @@ GROK_WALLET = "0xb1058c959987e3513600eb5b4fd82aeee2a0e4f9"
 DRB_TOKEN = "0x3ec2156d4c0a9cbdab4a016633b7bcf6a8d68ea2"
 WETH_TOKEN = "0x4200000000000000000000000000000000000006"
 
-DRB_COLOR = "#B49C94"
-WETH_COLOR = "#627EEA"
+DRB_COLOR = "#0a0b0b"
+WETH_COLOR = "#6c23e0"
 
 # Save the starfield background as this file
 GROK_BG_PATH = "assets/grok_wallet_bg.png"
@@ -362,7 +362,7 @@ def generate_balance_donut(
         wedgeprops=dict(width=0.35),
     )
     ax.set(aspect="equal")
-    ax.set_title("GROK WALLET", fontsize=20, fontweight="bold", pad=16)
+    ax.set_title("GROK WALLET", fontsize=24, fontweight="bold", pad=4)
 
     ax.text(0, 0, f"${total:,.0f}", ha="center", va="center", fontsize=25, fontweight="bold")
     ax.text(0, -0.18, "Total Balance", ha="center", va="center", fontsize=11, color="#666")
@@ -381,7 +381,7 @@ def generate_balance_donut(
             va="center",
             fontsize=12,
             fontweight="bold",
-            color="#111111",
+            color="#ffffff",
         )
 
     buf = BytesIO()
