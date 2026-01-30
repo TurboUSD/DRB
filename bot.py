@@ -385,8 +385,8 @@ def generate_balance_donut(
         )
 
     buf = BytesIO()
-    fig.subplots_adjust(top=0.88)  
-    plt.savefig(buf, format="png", dpi=170)
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=170, bbox_inches="tight")
     buf.seek(0)
     plt.close(fig)
     return buf
