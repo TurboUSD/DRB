@@ -35,11 +35,10 @@ WETH_TOKEN = "0x4200000000000000000000000000000000000006"
 DRB_COLOR = "#B49C94"
 WETH_COLOR = "#627EEA"
 
-# Put the background image here
-# Save your starfield image as: assets/grok_wallet_bg.png
+# Save the starfield background as this file
 GROK_BG_PATH = "assets/grok_wallet_bg.png"
 
-# Grok web card aspect
+# Grok web card size
 CARD_W = 896
 CARD_H = 658
 
@@ -124,13 +123,14 @@ def _load_fonts():
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
 
+    # Bigger to match the website look
     return {
-        "title": _try_font(bold_candidates, 56),
-        "big": _try_font(bold_candidates, 86),
-        "mid": _try_font(regular_candidates, 28),
-        "box_sym": _try_font(bold_candidates, 34),
-        "box_amt": _try_font(bold_candidates, 44),
-        "box_usd": _try_font(regular_candidates, 30),
+        "title": _try_font(bold_candidates, 72),
+        "big": _try_font(bold_candidates, 98),
+        "mid": _try_font(regular_candidates, 34),
+        "box_sym": _try_font(bold_candidates, 36),
+        "box_amt": _try_font(bold_candidates, 54),
+        "box_usd": _try_font(regular_candidates, 34),
     }
 
 
@@ -144,13 +144,30 @@ def _text_center(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont
     draw.text((x, y), text, font=font, fill=fill)
 
 
-def _draw_text_shadow(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font: ImageFont.ImageFont, fill, shadow=(0, 0, 0, 140), offset=(2, 2)):
+def _draw_text_shadow(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill,
+    shadow=(0, 0, 0, 140),
+    offset=(2, 2),
+):
     x, y = xy
     draw.text((x + offset[0], y + offset[1]), text, font=font, fill=shadow)
     draw.text((x, y), text, font=font, fill=fill)
 
 
-def _draw_center_shadow(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, y: int, width: int, fill, shadow=(0, 0, 0, 140), offset=(2, 2)):
+def _draw_center_shadow(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    y: int,
+    width: int,
+    fill,
+    shadow=(0, 0, 0, 140),
+    offset=(2, 2),
+):
     try:
         tw = draw.textlength(text, font=font)
         x = int((width - tw) / 2)
@@ -168,7 +185,13 @@ def _rounded_mask(size: tuple[int, int], radius: int) -> Image.Image:
     return m
 
 
-def _glass_panel(bg: Image.Image, rect: tuple[int, int, int, int], radius: int, tint=(20, 18, 40, 130), blur_radius=14) -> Image.Image:
+def _glass_panel(
+    bg: Image.Image,
+    rect: tuple[int, int, int, int],
+    radius: int,
+    tint=(20, 18, 40, 130),
+    blur_radius=14,
+) -> Image.Image:
     x1, y1, x2, y2 = rect
     crop = bg.crop((x1, y1, x2, y2)).filter(ImageFilter.GaussianBlur(blur_radius)).convert("RGBA")
     overlay = Image.new("RGBA", (x2 - x1, y2 - y1), tint)
@@ -178,11 +201,51 @@ def _glass_panel(bg: Image.Image, rect: tuple[int, int, int, int], radius: int, 
     panel = Image.new("RGBA", (x2 - x1, y2 - y1), (0, 0, 0, 0))
     panel.paste(crop, (0, 0), mask)
 
-    edge = Image.new("RGBA", (x2 - x1, y2 - y1), (255, 255, 255, 35))
+    # Subtle border like the website, no extra separators
+    edge = Image.new("RGBA", (x2 - x1, y2 - y1), (255, 255, 255, 26))
     border = Image.new("RGBA", (x2 - x1, y2 - y1), (0, 0, 0, 0))
     border.paste(edge, (0, 0), mask)
 
     return Image.alpha_composite(panel, border)
+
+
+def _text_h(font: ImageFont.ImageFont, s: str) -> int:
+    x0, y0, x1, y1 = font.getbbox(s)
+    return y1 - y0
+
+
+def draw_box_text_centered(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    sym: str,
+    amount: str,
+    usd: str,
+    font_sym: ImageFont.ImageFont,
+    font_amt: ImageFont.ImageFont,
+    font_usd: ImageFont.ImageFont,
+    color_sym=(235, 235, 245, 255),
+    color_amt=(255, 255, 255, 255),
+    color_usd=(175, 175, 200, 255),
+):
+    x1, y1, x2, y2 = box
+    w = x2 - x1
+    h = y2 - y1
+
+    gap1 = 8
+    gap2 = 6
+
+    h1 = _text_h(font_sym, sym)
+    h2 = _text_h(font_amt, amount)
+    h3 = _text_h(font_usd, usd)
+
+    total_h = h1 + gap1 + h2 + gap2 + h3
+    start_y = y1 + (h - total_h) // 2
+
+    px = x1 + 44
+
+    draw.text((px, start_y), sym, font=font_sym, fill=color_sym)
+    draw.text((px, start_y + h1 + gap1), amount, font=font_amt, fill=color_amt)
+    draw.text((px, start_y + h1 + gap1 + h2 + gap2), usd, font=font_usd, fill=color_usd)
 
 
 # ================= BALANCES =================
@@ -311,7 +374,8 @@ def generate_balance_donut(
         x = r * (math.cos(math.radians(ang)))
         y = r * (math.sin(math.radians(ang)))
         ax.text(
-            x, y,
+            x,
+            y,
             t,
             ha="center",
             va="center",
@@ -357,7 +421,7 @@ def make_balance_table_caption(
     return caption
 
 
-# ================= GROK2 STYLE CARD (same as web layout) =================
+# ================= GROK2 STYLE CARD =================
 
 def generate_grok_web_style_card(
     total_usd: float,
@@ -373,7 +437,7 @@ def generate_grok_web_style_card(
 
     WHITE = (255, 255, 255, 255)
     MUTED = (175, 175, 200, 255)
-    SOFT = (230, 230, 245, 255)
+    SOFT = (235, 235, 245, 255)
 
     canvas = bg.copy()
 
@@ -382,19 +446,18 @@ def generate_grok_web_style_card(
     outer_panel = _glass_panel(canvas, outer, radius=34, tint=(12, 10, 30, 145), blur_radius=18)
     canvas.alpha_composite(outer_panel, (outer[0], outer[1]))
 
-    # Inner separator line
     d = ImageDraw.Draw(canvas)
-    d.line((outer[0] + 28, 500, outer[2] - 28, 500), fill=(255, 255, 255, 40), width=1)
 
-    # Header text (no auth, no address, no 24h, no footer)
-    _draw_center_shadow(d, "GROK WALLET", fonts["title"], y=70, width=CARD_W, fill=WHITE, shadow=(0, 0, 0, 120))
-    _draw_center_shadow(d, f"${total_usd:,.0f}", fonts["big"], y=160, width=CARD_W, fill=WHITE, shadow=(0, 0, 0, 120))
-    _text_center(d, "Live Balance", fonts["mid"], y=270, width=CARD_W, fill=MUTED)
+    # Header texts (no auth line, no address, no 24h, no footer)
+    _draw_center_shadow(d, "GROK WALLET", fonts["title"], y=62, width=CARD_W, fill=WHITE, shadow=(0, 0, 0, 120))
+    _draw_center_shadow(d, f"${total_usd:,.0f}", fonts["big"], y=148, width=CARD_W, fill=WHITE, shadow=(0, 0, 0, 120))
+    _text_center(d, "Live Balance", fonts["mid"], y=264, width=CARD_W, fill=MUTED)
 
-    # Two inner glass boxes
-    box_y1, box_y2 = 330, 470
-    left = (outer[0] + 28, box_y1, (CARD_W // 2) - 14, box_y2)
-    right = ((CARD_W // 2) + 14, box_y1, outer[2] - 28, box_y2)
+    # Inner boxes
+    box_y1 = 324
+    box_y2 = 488
+    left = (outer[0] + 36, box_y1, (CARD_W // 2) - 18, box_y2)
+    right = ((CARD_W // 2) + 18, box_y1, outer[2] - 36, box_y2)
 
     left_panel = _glass_panel(canvas, left, radius=22, tint=(18, 18, 38, 150), blur_radius=16)
     right_panel = _glass_panel(canvas, right, radius=22, tint=(18, 18, 38, 150), blur_radius=16)
@@ -411,17 +474,34 @@ def generate_grok_web_style_card(
     drb_amt_str = fmt_compact_b(drb_amount_float)
     drb_usd_str = fmt_usd(drb_usd)
 
-    # Left box content (ETH)
-    lx, ly = left[0], left[1]
-    d.text((lx + 34, ly + 34), "ETH", font=fonts["box_sym"], fill=SOFT)
-    d.text((lx + 34, ly + 78), eth_amt_str, font=fonts["box_amt"], fill=WHITE)
-    d.text((lx + 34, ly + 122), eth_usd_str, font=fonts["box_usd"], fill=MUTED)
+    # Center the 3-line blocks vertically inside each box
+    draw_box_text_centered(
+        draw=d,
+        box=left,
+        sym="ETH",
+        amount=eth_amt_str,
+        usd=eth_usd_str,
+        font_sym=fonts["box_sym"],
+        font_amt=fonts["box_amt"],
+        font_usd=fonts["box_usd"],
+        color_sym=SOFT,
+        color_amt=WHITE,
+        color_usd=MUTED,
+    )
 
-    # Right box content (DRB)
-    rx, ry = right[0], right[1]
-    d.text((rx + 34, ry + 34), "DRB", font=fonts["box_sym"], fill=SOFT)
-    d.text((rx + 34, ry + 78), drb_amt_str, font=fonts["box_amt"], fill=WHITE)
-    d.text((rx + 34, ry + 122), drb_usd_str, font=fonts["box_usd"], fill=MUTED)
+    draw_box_text_centered(
+        draw=d,
+        box=right,
+        sym="DRB",
+        amount=drb_amt_str,
+        usd=drb_usd_str,
+        font_sym=fonts["box_sym"],
+        font_amt=fonts["box_amt"],
+        font_usd=fonts["box_usd"],
+        color_sym=SOFT,
+        color_amt=WHITE,
+        color_usd=MUTED,
+    )
 
     buf = BytesIO()
     canvas.convert("RGB").save(buf, format="PNG", optimize=True)
