@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from io import BytesIO
 
+from PIL import Image, ImageDraw, ImageFont
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -34,15 +36,19 @@ WETH_TOKEN = "0x4200000000000000000000000000000000000006"
 DRB_COLOR = "#B49C94"
 WETH_COLOR = "#627EEA"
 
+# Put your provided background image here
+# Create this file in your repo: assets/grok_wallet_bg.png
+GROK_BG_PATH = "assets/grok_wallet_bg.png"
+
 
 # ================= HELPERS =================
 
 def fmt_usd(x: float) -> str:
     return f"${x:,.0f}"
 
+
 def fmt_compact_b(n: float) -> str:
     return f"{n / 1_000_000_000:.2f}B"
-
 
 
 def _rpc_call(method: str, params: list):
@@ -129,7 +135,6 @@ def fetch_balances_and_values():
     }
 
 
-
 # ================= FEES =================
 
 def _parse_next_data(html: str):
@@ -186,7 +191,7 @@ def fetch_historical_fees_claimed():
     return None
 
 
-# ================= DONUT =================
+# ================= DONUT IMAGE =================
 
 def generate_balance_donut(
     drb_usd: float,
@@ -196,8 +201,8 @@ def generate_balance_donut(
 ):
     total = drb_usd + weth_usd
 
-    drb_amount_label = fmt_compact_b(drb_amount_float)   # 2.93B
-    weth_amount_label = f"{weth_amount_float:,.2f}"      # 121.80
+    drb_amount_label = fmt_compact_b(drb_amount_float)
+    weth_amount_label = f"{weth_amount_float:,.2f}"
 
     values = [drb_usd, weth_usd]
     colors = [DRB_COLOR, WETH_COLOR]
@@ -215,11 +220,10 @@ def generate_balance_donut(
     ax.text(0, 0, f"${total:,.0f}", ha="center", va="center", fontsize=22, fontweight="bold")
     ax.text(0, -0.18, "Total Balance", ha="center", va="center", fontsize=11, color="#666")
 
-    # Put token amounts inside each ring segment
     labels = [f"DRB\n{drb_amount_label}", f"WETH\n{weth_amount_label}"]
     for w, t in zip(wedges, labels):
         ang = (w.theta1 + w.theta2) / 2.0
-        r = 0.82  # radius for text placement (inside the ring)
+        r = 0.82
         x = r * (math.cos(math.radians(ang)))
         y = r * (math.sin(math.radians(ang)))
         ax.text(
@@ -238,7 +242,6 @@ def generate_balance_donut(
     buf.seek(0)
     plt.close(fig)
     return buf
-
 
 
 # ================= TABLE CAPTION =================
@@ -263,11 +266,7 @@ def make_balance_table_caption(
     c2 = max(len(r[1]) for r in rows)
     c3 = max(len(r[2]) for r in rows)
 
-    lines = [
-        f"{a:<{c1}}  {b:>{c2}}  {c:>{c3}}"
-        for a, b, c in rows
-    ]
-
+    lines = [f"{a:<{c1}}  {b:>{c2}}  {c:>{c3}}" for a, b, c in rows]
     caption = "<pre>" + "\n".join(lines) + "</pre>"
 
     if fees:
@@ -276,8 +275,102 @@ def make_balance_table_caption(
     return caption
 
 
+# ================= GROK2 STYLE CARD (BACKGROUND) =================
 
-# ================= COMMAND =================
+def _try_font(paths: list[str], size: int):
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _load_fonts():
+    bold_candidates = [
+        "assets/font_bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    regular_candidates = [
+        "assets/font_regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+
+    return {
+        "title": _try_font(bold_candidates, 60),
+        "big": _try_font(bold_candidates, 78),
+        "mid": _try_font(regular_candidates, 30),
+        "box_title": _try_font(bold_candidates, 34),
+        "box_amt": _try_font(bold_candidates, 44),
+        "box_usd": _try_font(regular_candidates, 30),
+    }
+
+
+def _text_center(draw: ImageDraw.ImageDraw, text: str, font, y: int, width: int, fill):
+    try:
+        tw = draw.textlength(text, font=font)
+        x = int((width - tw) / 2)
+    except Exception:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        x = int((width - (bbox[2] - bbox[0])) / 2)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def generate_grok_wallet_card_style(
+    total_usd: float,
+    weth_amount_float: float,
+    weth_usd: float,
+    drb_amount_float: float,
+    drb_usd: float,
+):
+    img = Image.open(GROK_BG_PATH).convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    W, H = img.size
+
+    fonts = _load_fonts()
+
+    WHITE = (255, 255, 255, 255)
+    GREY = (190, 190, 210, 255)
+    SOFT_WHITE = (235, 235, 245, 255)
+
+    total_str = f"${total_usd:,.0f}"
+
+    eth_amt_str = f"{weth_amount_float:,.2f}"
+    eth_usd_str = fmt_usd(weth_usd)
+
+    drb_amt_str = fmt_compact_b(drb_amount_float)
+    drb_usd_str = fmt_usd(drb_usd)
+
+    # Scale coordinates from the provided reference (896 x 658)
+    base_w, base_h = 896.0, 658.0
+    sx, sy = W / base_w, H / base_h
+
+    def px(x): return int(x * sx)
+    def py(y): return int(y * sy)
+
+    # Header (no "AUTH'D BY...", no address, no 24h)
+    _text_center(draw, "GROK WALLET", fonts["title"], y=py(60), width=W, fill=WHITE)
+    _text_center(draw, total_str, fonts["big"], y=py(165), width=W, fill=WHITE)
+    _text_center(draw, "Live Balance", fonts["mid"], y=py(265), width=W, fill=GREY)
+
+    # Left box (ETH)
+    draw.text((px(145), py(398)), "ETH", font=fonts["box_title"], fill=SOFT_WHITE)
+    draw.text((px(205), py(460)), eth_amt_str, font=fonts["box_amt"], fill=WHITE)
+    draw.text((px(225), py(520)), eth_usd_str, font=fonts["box_usd"], fill=GREY)
+
+    # Right box (DRB)
+    draw.text((px(530), py(398)), "DRB", font=fonts["box_title"], fill=SOFT_WHITE)
+    draw.text((px(560), py(460)), drb_amt_str, font=fonts["box_amt"], fill=WHITE)
+    draw.text((px(585), py(520)), drb_usd_str, font=fonts["box_usd"], fill=GREY)
+
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+# ================= COMMANDS =================
 
 async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -287,14 +380,12 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         b = fetch_balances_and_values()
 
-        # Update the call in grok_command to pass the amounts too
         donut = generate_balance_donut(
             b["DRB"]["usd_float"],
             b["WETH"]["usd_float"],
             b["DRB"]["amount_float"],
             b["WETH"]["amount_float"],
         )
-
 
         fees = fetch_historical_fees_claimed()
 
@@ -319,6 +410,35 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Error fetching balances")
 
 
+async def grok2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    try:
+        b = fetch_balances_and_values()
+        total_usd = b["DRB"]["usd_float"] + b["WETH"]["usd_float"]
+
+        card = generate_grok_wallet_card_style(
+            total_usd=total_usd,
+            weth_amount_float=b["WETH"]["amount_float"],
+            weth_usd=b["WETH"]["usd_float"],
+            drb_amount_float=b["DRB"]["amount_float"],
+            drb_usd=b["DRB"]["usd_float"],
+        )
+
+        await msg.reply_photo(photo=card)
+
+    except Exception as e:
+        err = repr(e)
+        print("grok2_command error:", err)
+        if ADMIN_ID > 0:
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"grok2_command error: {err}")
+            except Exception:
+                pass
+        await msg.reply_text("Error fetching balances")
+
 
 # ================= BOOT =================
 
@@ -339,6 +459,8 @@ def main():
     )
 
     app.add_handler(CommandHandler("grok", grok_command))
+    app.add_handler(CommandHandler("grok2", grok2_command))
+
     app.run_polling()
 
 
