@@ -362,9 +362,9 @@ def generate_balance_donut(
         wedgeprops=dict(width=0.35),
     )
     ax.set(aspect="equal")
-    ax.set_title("Grok Wallet Balance", fontsize=18, fontweight="bold", pad=16)
+    ax.set_title("GROK WALLET", fontsize=20, fontweight="bold", pad=16)
 
-    ax.text(0, 0, f"${total:,.0f}", ha="center", va="center", fontsize=22, fontweight="bold")
+    ax.text(0, 0, f"${total:,.0f}", ha="center", va="center", fontsize=25, fontweight="bold")
     ax.text(0, -0.18, "Total Balance", ha="center", va="center", fontsize=11, color="#666")
 
     labels = [f"DRB\n{drb_amount_label}", f"WETH\n{weth_amount_label}"]
