@@ -2,6 +2,7 @@
 import os
 import re
 import json
+import time
 import requests
 import math
 
@@ -21,8 +22,13 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+ETHERSCAN_APIKEY = os.environ.get("ETHERSCAN_APIKEY", "").strip() or os.environ.get("BASESCAN_API_KEY", "").strip()
 
-BASE_RPC_URL = "https://mainnet.base.org"
+# Alchemy RPC (default Scaffold-ETH 2 key) with Base mainnet fallback
+ALCHEMY_RPC_URL = "https://base-mainnet.g.alchemy.com/v2/8GVG8WjDs-sGFRr6Rm839"
+BASE_FALLBACK_RPC_URL = "https://mainnet.base.org"
+BASE_RPC_URL = ALCHEMY_RPC_URL  # primary
+
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
 GROK_WALLET_URL = "https://thegrokwallet.com/"
@@ -55,12 +61,19 @@ def fmt_compact_b(n: float) -> str:
 
 def _rpc_call(method: str, params: list):
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(BASE_RPC_URL, json=payload, headers=UA_HEADERS, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-    if "error" in j:
-        raise RuntimeError(str(j["error"]))
-    return j["result"]
+    # Try Alchemy first, then fallback to Base public RPC
+    for url in [ALCHEMY_RPC_URL, BASE_FALLBACK_RPC_URL]:
+        try:
+            r = requests.post(url, json=payload, headers=UA_HEADERS, timeout=20)
+            r.raise_for_status()
+            j = r.json()
+            if "error" in j:
+                raise RuntimeError(str(j["error"]))
+            return j["result"]
+        except Exception:
+            if url == BASE_FALLBACK_RPC_URL:
+                raise
+            continue
 
 
 def _pad32_hex_address(addr: str) -> str:
@@ -101,6 +114,151 @@ def fetch_price_usd(token: str) -> float:
         raise RuntimeError("No priceUsd found")
 
     return best_price
+
+
+# ================= DRB STATS HELPERS =================
+
+# 15-minute cache for /grok stats data
+_GROK_STATS_CACHE = {"ts": 0, "data": None}
+_GROK_STATS_CACHE_TTL = 900  # 15 minutes
+
+# Holder count cache (60 min)
+_HOLDERS_CACHE = {}
+
+
+def _short_addr_dots(a: str, left: int = 5, right: int = 5) -> str:
+    if not a:
+        return ""
+    a = a.strip()
+    if len(a) <= (left + right):
+        return a
+    return f"{a[:left]}...{a[-right:]}"
+
+
+def _fmt_price(price: float) -> str:
+    s = f"{price:.10f}".rstrip("0").rstrip(".")
+    return f"${s}"
+
+
+def _fmt_int_usd(x: float) -> str:
+    return f"${int(round(x)):,}"
+
+
+def _fmt_big(n: float) -> str:
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.2f}K"
+    return f"{n:.0f}"
+
+
+def fetch_price_and_fdv(token_addr: str):
+    """Fetch price and FDV (market cap) from DexScreener."""
+    r = requests.get(DEXSCREENER_TOKEN_URL + token_addr, headers=UA_HEADERS, timeout=20)
+    r.raise_for_status()
+    pairs = r.json().get("pairs") or []
+
+    best_price = None
+    best_fdv = None
+    best_liq = -1.0
+    for p in pairs:
+        try:
+            price = float(p.get("priceUsd") or 0)
+            liq = float((p.get("liquidity") or {}).get("usd") or 0)
+        except Exception:
+            continue
+        if price > 0 and liq > best_liq:
+            best_price = price
+            best_fdv = float(p.get("fdv") or 0)
+            best_liq = liq
+
+    return best_price, best_fdv
+
+
+def basescan_token_holder_count(token_addr: str):
+    """
+    Return current holder count for an ERC-20 token on Base.
+    1) Try Etherscan v2 tokenholdercount
+    2) Fallback: scrape basescan.org/token/<addr>
+    Cache TTL: 60 minutes (in-memory).
+    """
+    try:
+        token = (token_addr or "").strip().lower()
+        if not token or not token.startswith("0x"):
+            return None
+
+        now = time.time()
+        c = _HOLDERS_CACHE.get(token)
+
+        if c and (now - float(c.get("ts") or 0.0)) <= 3600:
+            v = int(c.get("count") or 0)
+            return v if v > 0 else None
+
+        # 1) Etherscan v2
+        try:
+            params = {
+                "chainid": 8453,
+                "module": "token",
+                "action": "tokenholdercount",
+                "contractaddress": token,
+            }
+            if ETHERSCAN_APIKEY:
+                params["apikey"] = ETHERSCAN_APIKEY
+
+            r = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=20)
+            r.raise_for_status()
+            j = r.json() if r.content else {}
+
+            if str(j.get("status") or "") == "1":
+                res = j.get("result")
+                n = int(str(res)) if res is not None else 0
+                if n > 0:
+                    _HOLDERS_CACHE[token] = {"ts": now, "count": n}
+                    return n
+        except Exception:
+            pass
+
+        # 2) Fallback: scrape Basescan token page
+        try:
+            url = f"https://basescan.org/token/{token}"
+            r = requests.get(
+                url,
+                timeout=20,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+            r.raise_for_status()
+            html = r.text or ""
+
+            html = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+            html = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", html)
+            text = re.sub(r"(?s)<[^>]+>", " ", html)
+            text = re.sub(r"\s+", " ", text).strip()
+
+            start_idx = text.lower().find("overview")
+            search_space = text[start_idx:] if start_idx != -1 else text
+
+            m = re.search(r"\bHolders\b\s*([0-9][0-9,]*)\b", search_space, re.IGNORECASE)
+            if not m:
+                m = re.search(r"\bHolders\b\s*([0-9][0-9,]*)\b", text, re.IGNORECASE)
+
+            if m:
+                n = int(m.group(1).replace(",", ""))
+                if n > 0:
+                    _HOLDERS_CACHE[token] = {"ts": now, "count": n}
+                    return n
+        except Exception:
+            pass
+
+    except Exception:
+        return None
+
+    return None
 
 
 def _try_font(paths: list[str], size: int) -> ImageFont.FreeTypeFont:
@@ -399,26 +557,51 @@ def make_balance_table_caption(
     weth_usd_str: str,
     fees: str | None,
 ) -> str:
-    drb_compact = fmt_compact_b(drb_amount_float)
+    """Build the CLAWD-style stats caption for /grok."""
+    now = time.time()
 
-    rows = [
-        ("Token", "Amount", "USD"),
-        ("-----", "------", "---"),
-        ("DRB", drb_compact, drb_usd_str),
-        ("WETH", weth_amount_str, weth_usd_str),
-    ]
+    # Use 15-min cache for stats (price, fdv, holders)
+    cached = _GROK_STATS_CACHE.get("data")
+    if cached and (now - _GROK_STATS_CACHE["ts"]) < _GROK_STATS_CACHE_TTL:
+        price = cached["price"]
+        fdv = cached["fdv"]
+        holders = cached["holders"]
+    else:
+        price, fdv = fetch_price_and_fdv(DRB_TOKEN)
+        holders = basescan_token_holder_count(DRB_TOKEN)
+        _GROK_STATS_CACHE["ts"] = now
+        _GROK_STATS_CACHE["data"] = {"price": price, "fdv": fdv, "holders": holders}
 
-    c1 = max(len(r[0]) for r in rows)
-    c2 = max(len(r[1]) for r in rows)
-    c3 = max(len(r[2]) for r in rows)
+    # DRB Stats block
+    lines = []
+    lines.append("<b>📊 DRB Stats</b>")
+    lines.append(f"Current price: {_fmt_price(price) if price else 'N/A'}")
+    lines.append(f"Market cap: {_fmt_int_usd(fdv) if fdv else 'N/A'}")
+    lines.append(f"Holders: {holders:,}" if holders is not None else "Holders: N/A")
+    lines.append("")
 
-    lines = [f"{a:<{c1}}  {b:>{c2}}  {c:>{c3}}" for a, b, c in rows]
-    caption = "<pre>" + "\n".join(lines) + "</pre>"
+    # Grok Wallet block
+    grok_addr = "0xB1058c959987E3513600EB5b4fD82Aeee2a0E4F9"
+    wallet_link = f"https://basescan.org/address/{grok_addr}"
+    wallet_html = f'<a href="{wallet_link}">{_short_addr_dots(grok_addr)}</a>'
 
-    if fees:
-        caption += f"\n\n{fees}\nHistorical Fees Claimed"
+    lines.append("<b>Grok Wallet</b>")
+    lines.append(wallet_html)
 
-    return caption
+    drb_compact = _fmt_big(drb_amount_float)
+    lines.append(f"{drb_compact} DRB ({drb_usd_str})")
+    lines.append(f"{weth_amount_str} WETH ({weth_usd_str})")
+
+    # Total value
+    try:
+        drb_val = float(drb_usd_str.replace("$", "").replace(",", ""))
+        weth_val = float(weth_usd_str.replace("$", "").replace(",", ""))
+        total_value = drb_val + weth_val
+        lines.append(f"Total value: {_fmt_int_usd(total_value)}")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
 
 
 # ================= GROK2 STYLE CARD =================
@@ -509,6 +692,24 @@ def generate_grok_web_style_card(
     return buf
 
 
+# ================= BALANCES CACHE (15 min) =================
+
+_BALANCES_CACHE = {"ts": 0, "data": None}
+_BALANCES_CACHE_TTL = 900  # 15 minutes
+
+
+def fetch_balances_cached():
+    """Fetch wallet balances with 15-minute cache."""
+    now = time.time()
+    if _BALANCES_CACHE["data"] and (now - _BALANCES_CACHE["ts"]) < _BALANCES_CACHE_TTL:
+        return _BALANCES_CACHE["data"]
+
+    data = fetch_balances_and_values()
+    _BALANCES_CACHE["ts"] = now
+    _BALANCES_CACHE["data"] = data
+    return data
+
+
 # ================= COMMANDS =================
 
 async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -517,7 +718,7 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        b = fetch_balances_and_values()
+        b = fetch_balances_cached()
 
         donut = generate_balance_donut(
             b["DRB"]["usd_float"],
@@ -555,7 +756,7 @@ async def grok2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        b = fetch_balances_and_values()
+        b = fetch_balances_cached()
         total_usd = b["DRB"]["usd_float"] + b["WETH"]["usd_float"]
 
         card = generate_grok_web_style_card(
