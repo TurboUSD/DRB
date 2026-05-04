@@ -536,7 +536,7 @@ def generate_balance_donut(
 
     drb_amount_label = fmt_compact_b(drb_amount_float)
     weth_amount_label = f"{weth_amount_float:,.2f}"
-    eth_amount_label = f"{eth_amount_float:,.4f}"
+    eth_amount_label = f"{eth_amount_float:,.2f}"
     if usdc_amount_float >= 1_000:
         usdc_amount_label = f"{usdc_amount_float / 1_000:.1f}k"
     else:
