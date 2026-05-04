@@ -41,7 +41,8 @@ USDC_TOKEN = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
 DRB_COLOR = "#0a0b0b"
 WETH_COLOR = "#6c23e0"
-USDC_COLOR = "#2775ca"
+ETH_COLOR = "#4a1a9e"   # lila más oscuro que WETH
+USDC_COLOR = "#55aaff"  # azul más claro para diferenciarse del lila
 
 # Save the starfield background as this file
 GROK_BG_PATH = "assets/grok_wallet_bg.png"
@@ -419,9 +420,13 @@ def fetch_balances_and_values():
     weth_raw = erc20_balance_of(WETH_TOKEN, GROK_WALLET)
     usdc_raw = erc20_balance_of(USDC_TOKEN, GROK_WALLET)
 
+    # Native ETH balance via eth_getBalance
+    eth_raw = int(_rpc_call("eth_getBalance", [GROK_WALLET, "latest"]), 16)
+
     drb_amt = drb_raw / 10 ** drb_dec
     weth_amt = weth_raw / 10 ** weth_dec
     usdc_amt = usdc_raw / 10 ** usdc_dec  # USDC = 6 decimals, price = $1
+    eth_amt = eth_raw / 10 ** 18
 
     drb_price = fetch_price_usd(DRB_TOKEN)
     weth_price = fetch_price_usd(WETH_TOKEN)
@@ -429,6 +434,7 @@ def fetch_balances_and_values():
     drb_usd = drb_amt * drb_price
     weth_usd = weth_amt * weth_price
     usdc_usd = usdc_amt  # 1 USDC = $1
+    eth_usd = eth_amt * weth_price  # ETH price ~= WETH price
 
     return {
         "DRB": {
@@ -442,6 +448,12 @@ def fetch_balances_and_values():
             "amount_float": float(weth_amt),
             "usd": fmt_usd(weth_usd),
             "usd_float": float(weth_usd),
+        },
+        "ETH": {
+            "amount": f"{eth_amt:,.4f}",
+            "amount_float": float(eth_amt),
+            "usd": fmt_usd(eth_usd),
+            "usd_float": float(eth_usd),
         },
         "USDC": {
             "amount": f"{usdc_amt:,.2f}",
@@ -515,18 +527,24 @@ def generate_balance_donut(
     weth_usd: float,
     drb_amount_float: float,
     weth_amount_float: float,
+    eth_usd: float = 0.0,
+    eth_amount_float: float = 0.0,
     usdc_usd: float = 0.0,
     usdc_amount_float: float = 0.0,
 ):
-    total = drb_usd + weth_usd + usdc_usd
+    total = drb_usd + weth_usd + eth_usd + usdc_usd
 
     drb_amount_label = fmt_compact_b(drb_amount_float)
     weth_amount_label = f"{weth_amount_float:,.2f}"
-    usdc_amount_label = f"{usdc_amount_float:,.2f}"
+    eth_amount_label = f"{eth_amount_float:,.4f}"
+    if usdc_amount_float >= 1_000:
+        usdc_amount_label = f"{usdc_amount_float / 1_000:.1f}k"
+    else:
+        usdc_amount_label = f"{usdc_amount_float:.1f}"
 
-    values = [drb_usd, weth_usd, usdc_usd]
-    colors = [DRB_COLOR, WETH_COLOR, USDC_COLOR]
-    labels = [f"DRB\n{drb_amount_label}", f"WETH\n{weth_amount_label}", f"USDC\n{usdc_amount_label}"]
+    values = [drb_usd, weth_usd, eth_usd, usdc_usd]
+    colors = [DRB_COLOR, WETH_COLOR, ETH_COLOR, USDC_COLOR]
+    labels = [f"DRB\n{drb_amount_label}", f"WETH\n{weth_amount_label}", f"ETH\n{eth_amount_label}", f"USDC\n{usdc_amount_label}"]
 
     # Filter out zero values to avoid empty wedges
     filtered = [(v, c, l) for v, c, l in zip(values, colors, labels) if v > 0]
@@ -577,6 +595,8 @@ def make_balance_table_caption(
     drb_usd_str: str,
     weth_amount_str: str,
     weth_usd_str: str,
+    eth_amount_str: str,
+    eth_usd_str: str,
     usdc_amount_str: str,
     usdc_usd_str: str,
     fees: str | None,
@@ -615,14 +635,16 @@ def make_balance_table_caption(
     drb_compact = _fmt_big(drb_amount_float)
     lines.append(f"{drb_compact} DRB ({drb_usd_str})")
     lines.append(f"{weth_amount_str} WETH ({weth_usd_str})")
+    lines.append(f"{eth_amount_str} ETH ({eth_usd_str})")
     lines.append(f"{usdc_amount_str} USDC ({usdc_usd_str})")
 
     # Total value
     try:
         drb_val = float(drb_usd_str.replace("$", "").replace(",", ""))
         weth_val = float(weth_usd_str.replace("$", "").replace(",", ""))
+        eth_val = float(eth_usd_str.replace("$", "").replace(",", ""))
         usdc_val = float(usdc_usd_str.replace("$", "").replace(",", ""))
-        total_value = drb_val + weth_val + usdc_val
+        total_value = drb_val + weth_val + eth_val + usdc_val
         lines.append(f"Total value: {_fmt_int_usd(total_value)}")
     except Exception:
         pass
@@ -751,6 +773,8 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             b["WETH"]["usd_float"],
             b["DRB"]["amount_float"],
             b["WETH"]["amount_float"],
+            eth_usd=b["ETH"]["usd_float"],
+            eth_amount_float=b["ETH"]["amount_float"],
             usdc_usd=b["USDC"]["usd_float"],
             usdc_amount_float=b["USDC"]["amount_float"],
         )
@@ -762,6 +786,8 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             drb_usd_str=b["DRB"]["usd"],
             weth_amount_str=b["WETH"]["amount"],
             weth_usd_str=b["WETH"]["usd"],
+            eth_amount_str=b["ETH"]["amount"],
+            eth_usd_str=b["ETH"]["usd"],
             usdc_amount_str=b["USDC"]["amount"],
             usdc_usd_str=b["USDC"]["usd"],
             fees=fees,
@@ -787,7 +813,7 @@ async def grok2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         b = fetch_balances_cached()
-        total_usd = b["DRB"]["usd_float"] + b["WETH"]["usd_float"] + b["USDC"]["usd_float"]
+        total_usd = b["DRB"]["usd_float"] + b["WETH"]["usd_float"] + b["ETH"]["usd_float"] + b["USDC"]["usd_float"]
 
         card = generate_grok_web_style_card(
             total_usd=total_usd,
