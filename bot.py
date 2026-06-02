@@ -890,11 +890,9 @@ def _do_claim_tx() -> dict:
     if not CLAIM_PRIVATE_KEY:
         raise RuntimeError("CLAIM_PRIVATE_KEY env variable not set")
 
-    w3 = Web3(Web3.HTTPProvider(ALCHEMY_RPC_URL))
+    w3 = Web3(Web3.HTTPProvider(BASE_FALLBACK_RPC_URL))
     if not w3.is_connected():
-        w3 = Web3(Web3.HTTPProvider(BASE_FALLBACK_RPC_URL))
-        if not w3.is_connected():
-            raise RuntimeError("Cannot connect to Base RPC")
+        raise RuntimeError("Cannot connect to Base RPC")
 
     account = w3.eth.account.from_key(CLAIM_PRIVATE_KEY)
     print(f"[claim] Signer address: {account.address}")
@@ -924,26 +922,37 @@ def _do_claim_tx() -> dict:
     if receipt.status != 1:
         raise RuntimeError("Transaction reverted")
 
-    # Parse Transfer events — sum all WETH and DRB transferred out of the contract
+    # Parse Transfer events — sum all WETH and DRB transfers in this tx
     weth_claimed = 0.0
     drb_claimed = 0.0
-    contract_lower = CLAIM_CONTRACT.lower()
 
-    # ERC-20 Transfer topic
+    # ERC-20 Transfer topic (without 0x prefix for comparison)
     transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+    if transfer_topic.startswith("0x"):
+        transfer_topic = transfer_topic[2:]
 
     for log in receipt.logs:
         if len(log["topics"]) < 3:
             continue
-        if log["topics"][0].hex() != transfer_topic:
-            continue
-
-        from_addr = "0x" + log["topics"][1].hex()[-40:]
-        if from_addr.lower() != contract_lower:
+        topic0 = log["topics"][0].hex()
+        if topic0.startswith("0x"):
+            topic0 = topic0[2:]
+        if topic0 != transfer_topic:
             continue
 
         token_addr = log["address"].lower()
-        raw_value = int(log["data"].hex(), 16)
+        if token_addr not in (WETH_TOKEN.lower(), DRB_TOKEN.lower()):
+            continue
+
+        to_addr = "0x" + log["topics"][2].hex().lstrip("0x").zfill(40)[-40:]
+        if to_addr.lower() != GROK_WALLET.lower():
+            continue
+
+        data = log["data"]
+        if isinstance(data, (bytes, bytearray)):
+            raw_value = int(data.hex(), 16)
+        else:
+            raw_value = int(data, 16)
 
         if token_addr == WETH_TOKEN.lower():
             weth_claimed += raw_value / 10 ** 18
