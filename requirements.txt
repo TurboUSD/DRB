@@ -2,3 +2,4 @@ python-telegram-bot==20.0
 requests
 beautifulsoup4
 matplotlib
+web3
