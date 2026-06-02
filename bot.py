@@ -14,8 +14,9 @@ from io import BytesIO
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import asyncio
 
 
 # ================= CONFIG =================
@@ -38,6 +39,30 @@ GROK_WALLET = "0xb1058c959987e3513600eb5b4fd82aeee2a0e4f9"
 DRB_TOKEN = "0x3ec2156d4c0a9cbdab4a016633b7bcf6a8d68ea2"
 WETH_TOKEN = "0x4200000000000000000000000000000000000006"
 USDC_TOKEN = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+# Claim fees config
+CLAIM_CONTRACT = "0x375c15db32d28cecdcab5c03ab889bf15cbd2c5e"
+CLAIM_RECIPIENT = "0x3ec2156D4c0A9CBdAB4a016633b7BcF6a8d68Ea2"
+CLAIM_PRIVATE_KEY = os.environ.get("CLAIM_PRIVATE_KEY", "").strip()
+
+CLAIM_ABI = [
+    {
+        "name": "claimRewards",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [{"name": "recipient", "type": "address"}],
+        "outputs": [],
+    },
+    {
+        "name": "Transfer",
+        "type": "event",
+        "inputs": [
+            {"name": "from", "type": "address", "indexed": True},
+            {"name": "to",   "type": "address", "indexed": True},
+            {"name": "value","type": "uint256",  "indexed": False},
+        ],
+    },
+]
 
 DRB_COLOR = "#0a0b0b"
 WETH_COLOR = "#6c23e0"
@@ -836,7 +861,169 @@ async def grok2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Error fetching balances")
 
 
-# ================= BOOT =================
+
+# ================= CLAIM FEES =================
+
+async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Return True if the message sender is an admin (or creator) of the chat."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return False
+    # In private chats, only allow ADMIN_ID
+    if msg.chat.type == "private":
+        return user.id == ADMIN_ID
+    try:
+        member = await context.bot.get_chat_member(msg.chat_id, user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+def _do_claim_tx() -> dict:
+    """
+    Execute claimRewards on-chain.
+    Returns dict with keys: tx_hash, weth_claimed, drb_claimed (floats).
+    Raises on failure.
+    """
+    if not CLAIM_PRIVATE_KEY:
+        raise RuntimeError("CLAIM_PRIVATE_KEY env variable not set")
+
+    w3 = Web3(Web3.HTTPProvider(ALCHEMY_RPC_URL))
+    if not w3.is_connected():
+        w3 = Web3(Web3.HTTPProvider(BASE_FALLBACK_RPC_URL))
+        if not w3.is_connected():
+            raise RuntimeError("Cannot connect to Base RPC")
+
+    account = w3.eth.account.from_key(CLAIM_PRIVATE_KEY)
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(CLAIM_CONTRACT),
+        abi=CLAIM_ABI,
+    )
+    recipient_cs = Web3.to_checksum_address(CLAIM_RECIPIENT)
+
+    nonce = w3.eth.get_transaction_count(account.address, "pending")
+    gas_price = w3.eth.gas_price
+
+    tx = contract.functions.claimRewards(recipient_cs).build_transaction({
+        "from": account.address,
+        "nonce": nonce,
+        "gas": 300_000,
+        "gasPrice": gas_price,
+    })
+
+    signed = w3.eth.account.sign_transaction(tx, CLAIM_PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+    if receipt.status != 1:
+        raise RuntimeError("Transaction reverted")
+
+    # Parse Transfer events for WETH and DRB received by recipient
+    weth_claimed = 0.0
+    drb_claimed = 0.0
+    recipient_lower = recipient_cs.lower()
+
+    # ERC-20 Transfer topic
+    transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+
+    for log in receipt.logs:
+        if len(log["topics"]) < 3:
+            continue
+        if log["topics"][0].hex() != transfer_topic:
+            continue
+
+        to_addr = "0x" + log["topics"][2].hex()[-40:]
+        if to_addr.lower() != recipient_lower:
+            continue
+
+        token_addr = log["address"].lower()
+        raw_value = int(log["data"].hex(), 16)
+
+        if token_addr == WETH_TOKEN.lower():
+            weth_claimed = raw_value / 10 ** 18
+        elif token_addr == DRB_TOKEN.lower():
+            drb_claimed = raw_value / 10 ** 18  # DRB has 18 decimals
+
+    return {
+        "tx_hash": tx_hash.hex(),
+        "weth_claimed": weth_claimed,
+        "drb_claimed": drb_claimed,
+    }
+
+
+def _fmt_drb_millions(amount: float) -> str:
+    """Format DRB amount as e.g. 10.04M with 2 decimal places."""
+    return f"{amount / 1_000_000:.2f}M"
+
+
+async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
+    if not await _is_group_admin(update, context):
+        await msg.reply_text("⛔ Only group admins can use this command.")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ CLAIM", callback_data="claim_confirm"),
+            InlineKeyboardButton("❌ CANCEL", callback_data="claim_cancel"),
+        ]
+    ])
+    await msg.reply_text(
+        "💰 <b>Claim Trading Fees</b>\n\n"
+        "Do you want to claim the accumulated trading fees from the contract?\n\n"
+        "This will send a transaction on Base mainnet.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    # Admin check on the callback user
+    if not await _is_group_admin(update, context):
+        await query.answer("⛔ You are not an admin.", show_alert=True)
+        return
+
+    await query.answer()
+
+    if query.data == "claim_cancel":
+        await query.edit_message_text("❌ Claim cancelled.")
+        return
+
+    # claim_confirm
+    await query.edit_message_text("⏳ Sending claim transaction, please wait...")
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, _do_claim_tx)
+
+        tx_url = f"https://basescan.org/tx/{result['tx_hash']}"
+        weth = result["weth_claimed"]
+        drb = result["drb_claimed"]
+
+        text = (
+            "✅ <b>Fees claimed successfully!</b>\n\n"
+            f"🔷 WETH claimed: <b>{weth:.2f} WETH</b>\n"
+            f"🟣 DRB claimed: <b>{_fmt_drb_millions(drb)} DRB</b>\n\n"
+            f'🔗 <a href="{tx_url}">View transaction on Basescan</a>'
+        )
+        await query.edit_message_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+    except Exception as e:
+        err = repr(e)
+        print("claim_callback error:", err)
+        await query.edit_message_text(
+            f"❌ <b>Claim failed</b>\n\n<code>{err}</code>",
+            parse_mode="HTML",
+        )
+
+
 
 async def on_startup(app):
     if ADMIN_ID > 0:
@@ -856,6 +1043,8 @@ def main():
 
     app.add_handler(CommandHandler("grok", grok_command))
     app.add_handler(CommandHandler("grok2", grok2_command))
+    app.add_handler(CommandHandler("claim", claim_command))
+    app.add_handler(CallbackQueryHandler(claim_callback, pattern="^claim_"))
 
     app.run_polling()
 
