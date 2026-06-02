@@ -51,7 +51,7 @@ CLAIM_ABI = [
         "name": "claimRewards",
         "type": "function",
         "stateMutability": "nonpayable",
-        "inputs": [{"name": "recipient", "type": "address"}],
+        "inputs": [{"name": "token", "type": "address"}],
         "outputs": [],
     },
     {
@@ -905,18 +905,18 @@ def _do_claim_tx() -> dict:
         address=Web3.to_checksum_address(CLAIM_CONTRACT),
         abi=CLAIM_ABI,
     )
-    recipient_cs = Web3.to_checksum_address(CLAIM_RECIPIENT)
-
     nonce = w3.eth.get_transaction_count(account.address, "pending")
-    gas_price = w3.eth.gas_price
+    token_cs = Web3.to_checksum_address(DRB_TOKEN)
 
-    tx = contract.functions.claimRewards(recipient_cs).build_transaction({
+    tx = contract.functions.claimRewards(token_cs).build_transaction({
         "from": account.address,
         "nonce": nonce,
-        "gas": 200_000,
-        "gasPrice": gas_price,
+        "gas": 300_000,
+        "maxFeePerGas": w3.to_wei(0.1, "gwei"),
+        "maxPriorityFeePerGas": w3.to_wei(0.013, "gwei"),
         "value": 0,
         "chainId": 8453,
+        "type": 2,
     })
 
     signed = w3.eth.account.sign_transaction(tx, CLAIM_PRIVATE_KEY)
@@ -926,10 +926,10 @@ def _do_claim_tx() -> dict:
     if receipt.status != 1:
         raise RuntimeError("Transaction reverted")
 
-    # Parse Transfer events for WETH and DRB received by recipient
+    # Parse Transfer events — sum all WETH and DRB transferred out of the contract
     weth_claimed = 0.0
     drb_claimed = 0.0
-    recipient_lower = recipient_cs.lower()
+    contract_lower = CLAIM_CONTRACT.lower()
 
     # ERC-20 Transfer topic
     transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)").hex()
@@ -940,17 +940,17 @@ def _do_claim_tx() -> dict:
         if log["topics"][0].hex() != transfer_topic:
             continue
 
-        to_addr = "0x" + log["topics"][2].hex()[-40:]
-        if to_addr.lower() != recipient_lower:
+        from_addr = "0x" + log["topics"][1].hex()[-40:]
+        if from_addr.lower() != contract_lower:
             continue
 
         token_addr = log["address"].lower()
         raw_value = int(log["data"].hex(), 16)
 
         if token_addr == WETH_TOKEN.lower():
-            weth_claimed = raw_value / 10 ** 18
+            weth_claimed += raw_value / 10 ** 18
         elif token_addr == DRB_TOKEN.lower():
-            drb_claimed = raw_value / 10 ** 18  # DRB has 18 decimals
+            drb_claimed += raw_value / 10 ** 18
 
     return {
         "tx_hash": tx_hash.hex(),
