@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 import asyncio
+from web3 import Web3
 
 
 # ================= CONFIG =================
