@@ -975,9 +975,34 @@ def _do_claim_tx() -> dict:
     }
 
 
+def _fmt_sig(amount: float, suffix: str = "") -> str:
+    """Format a float showing at least 2 decimals, or up to first significant digit if < 0.01."""
+    if amount == 0:
+        return f"0.00{suffix}"
+    if abs(amount) >= 0.01:
+        return f"{amount:.2f}{suffix}"
+    # Find first significant digit and show 2 sig digits after it
+    import math
+    mag = -int(math.floor(math.log10(abs(amount)))) + 1
+    decimals = max(2, mag)
+    return f"{amount:.{decimals}f}{suffix}"
+
+
 def _fmt_drb_millions(amount: float) -> str:
-    """Format DRB amount as e.g. 10.04M with 2 decimal places."""
-    return f"{amount / 1_000_000:.2f}M"
+    """Format DRB: uses M suffix if >= 1M, otherwise shows as comma-separated integer."""
+    if amount == 0:
+        return "0.00M"
+    if amount >= 1_000_000:
+        return _fmt_sig(amount / 1_000_000, "M")
+    # Less than 1M: show as integer with thousands separator
+    if amount >= 1:
+        return f"{amount:,.0f}"
+    return _fmt_sig(amount)
+
+
+def _fmt_weth(amount: float) -> str:
+    """Format WETH amount showing at least first significant digit."""
+    return _fmt_sig(amount)
 
 
 async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1065,7 +1090,7 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             "✅ <b>Fees claimed successfully!</b>\n\n"
-            f"🔷 WETH claimed: <b>{weth:.2f} WETH</b>\n"
+            f"🔷 WETH claimed: <b>{_fmt_weth(weth)} WETH</b>\n"
             f"🟣 DRB claimed: <b>{_fmt_drb_millions(drb)} DRB</b>\n\n"
             f'🔗 <a href="{tx_url}">View transaction on Basescan</a>'
         )
