@@ -44,7 +44,7 @@ USDC_TOKEN = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 # Claim fees config
 CLAIM_CONTRACT = "0x375c15db32d28cecdcab5c03ab889bf15cbd2c5e"
 CLAIM_RECIPIENT = "0x3ec2156D4c0A9CBdAB4a016633b7BcF6a8d68Ea2"
-CLAIM_PRIVATE_KEY = os.environ.get("CLAIM_PRIVATE_KEY", "").strip()
+CLAIM_PRIVATE_KEY = os.environ.get("CLAIM_PRIVATE_KEY", "").strip().removeprefix("0x")
 
 CLAIM_ABI = [
     {
@@ -897,6 +897,10 @@ def _do_claim_tx() -> dict:
             raise RuntimeError("Cannot connect to Base RPC")
 
     account = w3.eth.account.from_key(CLAIM_PRIVATE_KEY)
+    print(f"[claim] Signer address: {account.address}")
+    balance = w3.eth.get_balance(account.address)
+    print(f"[claim] Signer ETH balance: {balance / 10**18:.6f} ETH")
+
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(CLAIM_CONTRACT),
         abi=CLAIM_ABI,
@@ -909,7 +913,7 @@ def _do_claim_tx() -> dict:
     tx = contract.functions.claimRewards(recipient_cs).build_transaction({
         "from": account.address,
         "nonce": nonce,
-        "gas": 300_000,
+        "gas": 200_000,
         "gasPrice": gas_price,
     })
 
