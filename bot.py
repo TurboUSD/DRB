@@ -912,11 +912,9 @@ def _do_claim_tx() -> dict:
         "from": account.address,
         "nonce": nonce,
         "gas": 300_000,
-        "maxFeePerGas": w3.to_wei(0.1, "gwei"),
-        "maxPriorityFeePerGas": w3.to_wei(0.013, "gwei"),
+        "gasPrice": w3.to_wei(0.02, "gwei"),
         "value": 0,
         "chainId": 8453,
-        "type": 2,
     })
 
     signed = w3.eth.account.sign_transaction(tx, CLAIM_PRIVATE_KEY)
