@@ -15,7 +15,7 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import asyncio
 from web3 import Web3
 
@@ -865,6 +865,15 @@ async def grok2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= CLAIM FEES =================
 
+CLAIM_COOLDOWN_SECONDS = 8 * 3600  # 8 hours between claims
+_last_claim_ts = 0.0
+_last_claim_tx = None
+
+# Track per-user "not admin" warnings to avoid spam: {user_id: (last_warn_ts, msg_count_since)}
+_non_admin_warn: dict = {}
+NON_ADMIN_WARN_COOLDOWN = 3600   # 1 hour
+NON_ADMIN_WARN_MSG_GAP  = 20     # or 20 messages since last warning
+
 async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Return True if the message sender is an admin (or creator) of the chat."""
     msg = update.effective_message
@@ -972,12 +981,41 @@ def _fmt_drb_millions(amount: float) -> str:
 
 
 async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _non_admin_warn
     msg = update.effective_message
     if not msg:
         return
 
+    user = update.effective_user
     if not await _is_group_admin(update, context):
-        await msg.reply_text("⛔ Only group admins can use this command.")
+        now = time.time()
+        uid = user.id if user else 0
+        warn = _non_admin_warn.get(uid)
+        # Only warn if enough time has passed OR enough messages since last warning
+        msg_count = context.chat_data.get("msg_count", 0)
+        should_warn = (
+            warn is None
+            or (now - warn[0]) >= NON_ADMIN_WARN_COOLDOWN
+            or (msg_count - warn[1]) >= NON_ADMIN_WARN_MSG_GAP
+        )
+        if should_warn:
+            _non_admin_warn[uid] = (now, msg_count)
+            await msg.reply_text("⛔ Only group admins can use this command.")
+        return
+
+    # Cooldown check
+    now = time.time()
+    elapsed = now - _last_claim_ts
+    if _last_claim_ts > 0 and elapsed < CLAIM_COOLDOWN_SECONDS:
+        remaining_h = (CLAIM_COOLDOWN_SECONDS - elapsed) / 3600
+        tx_line = ""
+        if _last_claim_tx:
+            tx_line = f'\n🔗 <a href="https://basescan.org/tx/{_last_claim_tx}">Last claim tx</a>'
+        await msg.reply_text(
+            f"⏳ Too soon! Next claim available in <b>{remaining_h:.1f}h</b>.{tx_line}",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         return
 
     keyboard = InlineKeyboardMarkup([
@@ -1021,6 +1059,10 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         weth = result["weth_claimed"]
         drb = result["drb_claimed"]
 
+        global _last_claim_ts, _last_claim_tx
+        _last_claim_ts = time.time()
+        _last_claim_tx = result["tx_hash"]
+
         text = (
             "✅ <b>Fees claimed successfully!</b>\n\n"
             f"🔷 WETH claimed: <b>{weth:.2f} WETH</b>\n"
@@ -1037,6 +1079,11 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
+
+
+async def _count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Increment per-chat message counter for non-admin warning cooldown."""
+    context.chat_data["msg_count"] = context.chat_data.get("msg_count", 0) + 1
 
 
 async def on_startup(app):
@@ -1059,6 +1106,7 @@ def main():
     app.add_handler(CommandHandler("grok2", grok2_command))
     app.add_handler(CommandHandler("claim", claim_command))
     app.add_handler(CallbackQueryHandler(claim_callback, pattern="^claim_"))
+    app.add_handler(MessageHandler(filters.ALL, _count_message), group=1)
 
     app.run_polling()
 
