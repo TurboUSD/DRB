@@ -915,6 +915,8 @@ def _do_claim_tx() -> dict:
         "nonce": nonce,
         "gas": 200_000,
         "gasPrice": gas_price,
+        "value": 0,
+        "chainId": 8453,
     })
 
     signed = w3.eth.account.sign_transaction(tx, CLAIM_PRIVATE_KEY)
