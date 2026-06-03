@@ -1090,9 +1090,9 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             "✅ <b>Fees claimed successfully!</b>\n\n"
-            f"🔷 WETH claimed: <b>{_fmt_weth(weth)} WETH</b>\n"
-            f"🟣 DRB claimed: <b>{_fmt_drb_millions(drb)} DRB</b>\n\n"
-            f'🔗 <a href="{tx_url}">View transaction on Basescan</a>'
+            f"{_fmt_weth(weth)} WETH\n"
+            f"{_fmt_drb_millions(drb)} DRB\n\n"
+            f'🔗 <a href="{tx_url}">View transaction</a>'
         )
         await query.edit_message_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
