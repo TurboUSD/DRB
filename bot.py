@@ -1195,12 +1195,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buf, drb_total, weth_total, growth, growth_pct = await asyncio.get_event_loop().run_in_executor(
             None, generate_stats_chart, days
         )
-        sign = "+" if growth >= 0 else "-"
-        pct_str = f" ({growth_pct:+.1f}%)" if growth_pct is not None else ""
+        if growth_pct is not None:
+            growth_str = f"{growth_pct:+.1f}%"
+        else:
+            sign = "+" if growth >= 0 else "-"
+            growth_str = f"{sign}{_fmt_big(abs(growth))} DRB"
         caption = (
             f"📊 <b>Claim stats — last {days} days</b>\n"
             f"Total claimed: <b>{_fmt_drb_millions(drb_total)} DRB</b> · <b>{_fmt_weth(weth_total)} WETH</b>\n"
-            f"Grok Wallet: <b>{sign}{_fmt_big(abs(growth))} DRB</b>{pct_str}"
+            f"Grok Wallet: <b>{growth_str}</b>"
         )
         await msg.reply_photo(photo=buf, caption=caption, parse_mode="HTML")
     except Exception as e:
@@ -1371,16 +1374,16 @@ def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
         lines.append(f"🪙 | Got: <b>{_fmt_big(b['drb'])} DRB</b>")
         lines.append(f'👛 | <a href="{wallet_url}">{_short_addr_buys(b["to"])}</a> | <a href="{tx_url}">Txn</a>')
 
-    top_total = sum(b["usd"] for b in top)
-    total_drb_bought = sum(b["drb"] for b in buys)
+    top_total_usd = sum(b["usd"] for b in top)
+    top_total_drb = sum(b["drb"] for b in top)
     over_1k = sum(1 for b in buys if b["usd"] >= 1000)
     summary = f"📊 | {len(buys)} buys"
     if over_1k:
         summary += f" · {over_1k} over $1K"
-    summary += f" · <b>{_fmt_big(total_drb_bought)} DRB</b> bought"
-    summary += f" | Top {len(top)} total: <b>${top_total:,.2f}</b>"
     lines.append("")
     lines.append(summary)
+    lines.append("")
+    lines.append(f"Top {len(top)} total: <b>{_fmt_big(top_total_drb)} DRB</b> · <b>${top_total_usd:,.2f}</b>")
 
     text = "\n".join(lines)
     _BUYS_RESULT_CACHE[days] = {"ts": now, "text": text}
