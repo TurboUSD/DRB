@@ -10,7 +10,11 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
+from matplotlib.patches import Patch
 from io import BytesIO
+from datetime import datetime, timedelta, timezone
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -863,6 +867,408 @@ async def grok2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# ================= STATS (/stats) =================
+
+_TRANSFERS_CACHE = {}
+_TRANSFERS_CACHE_TTL = 900  # 15 minutes
+STATS_DEFAULT_DAYS = 30
+STATS_MAX_DAYS = 365
+
+
+def fetch_token_transfers(token: str, wallet: str, startblock: int = 0) -> list:
+    """All ERC-20 transfers of `token` involving `wallet` on Base (Etherscan v2, cached 15 min)."""
+    key = (token.lower(), wallet.lower(), int(startblock))
+    now = time.time()
+    c = _TRANSFERS_CACHE.get(key)
+    if c and (now - c["ts"]) < _TRANSFERS_CACHE_TTL:
+        return c["data"]
+
+    txs = []
+    startblock = int(startblock)
+    for _ in range(20):  # safety bound
+        params = {
+            "chainid": 8453,
+            "module": "account",
+            "action": "tokentx",
+            "contractaddress": token,
+            "address": wallet,
+            "startblock": startblock,
+            "endblock": 999999999,
+            "page": 1,
+            "offset": 10000,
+            "sort": "asc",
+        }
+        if ETHERSCAN_APIKEY:
+            params["apikey"] = ETHERSCAN_APIKEY
+
+        r = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=30)
+        r.raise_for_status()
+        j = r.json() if r.content else {}
+        result = j.get("result")
+        if not isinstance(result, list):
+            break
+        txs.extend(result)
+        if len(result) < 10000:
+            break
+        startblock = int(result[-1]["blockNumber"]) + 1
+
+    # Dedupe possible duplicates at pagination borders
+    seen = set()
+    unique = []
+    for t in txs:
+        k = (t.get("hash"), t.get("from"), t.get("to"), t.get("value"), t.get("timeStamp"))
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(t)
+
+    _TRANSFERS_CACHE[key] = {"ts": now, "data": unique}
+    return unique
+
+
+def _tx_amount(t: dict) -> float:
+    dec = int(t.get("tokenDecimal") or 18)
+    return int(t.get("value") or 0) / 10 ** dec
+
+
+def _parse_stats_period(args, default_days: int = STATS_DEFAULT_DAYS) -> int:
+    """Parse '7d' / '4w' / '15' from command args."""
+    days = default_days
+    if args:
+        m = re.match(r"^(\d+)\s*([dwDW])?$", str(args[0]).strip())
+        if m:
+            n = int(m.group(1))
+            unit = (m.group(2) or "d").lower()
+            days = n * 7 if unit == "w" else n
+    return max(1, min(days, STATS_MAX_DAYS))
+
+
+def _daily_claims(txs: list, days: int, end_date) -> tuple:
+    """Sum incoming transfers to the Grok wallet per day for the last `days` days.
+    Prefers transfers coming from the claim contract; falls back to all incoming."""
+    wallet_l = GROK_WALLET.lower()
+    incoming = [t for t in txs if (t.get("to") or "").lower() == wallet_l]
+    from_claim = [t for t in incoming if (t.get("from") or "").lower() == CLAIM_CONTRACT.lower()]
+    use = from_claim if from_claim else incoming
+
+    daily = {}
+    for t in use:
+        d = datetime.fromtimestamp(int(t["timeStamp"]), tz=timezone.utc).date()
+        daily[d] = daily.get(d, 0.0) + _tx_amount(t)
+
+    dates = [end_date - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    return dates, [daily.get(d, 0.0) for d in dates]
+
+
+def _drb_balance_series(txs: list) -> list:
+    """Running DRB balance of the Grok wallet over time: [(timestamp, balance), ...]."""
+    wallet_l = GROK_WALLET.lower()
+    events = []
+    for t in txs:
+        amt = _tx_amount(t)
+        delta = 0.0
+        if (t.get("to") or "").lower() == wallet_l:
+            delta += amt
+        if (t.get("from") or "").lower() == wallet_l:
+            delta -= amt
+        if delta != 0.0:
+            events.append((int(t["timeStamp"]), delta))
+    events.sort(key=lambda e: e[0])
+
+    series = []
+    bal = 0.0
+    for ts, delta in events:
+        bal += delta
+        series.append((ts, max(bal, 0.0)))
+    return series
+
+
+def generate_stats_chart(days: int):
+    """Build the /stats image: daily claims bars (DRB + WETH) and DRB accumulation area chart.
+    Returns (png_buffer, drb_total_claimed, weth_total_claimed)."""
+    drb_txs = fetch_token_transfers(DRB_TOKEN, GROK_WALLET)
+    weth_txs = fetch_token_transfers(WETH_TOKEN, GROK_WALLET)
+
+    now_utc = datetime.now(timezone.utc)
+    end_date = now_utc.date()
+
+    dates, drb_vals = _daily_claims(drb_txs, days, end_date)
+    _, weth_vals = _daily_claims(weth_txs, days, end_date)
+
+    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(11, 10))
+    fig.subplots_adjust(hspace=0.42)
+
+    # ---- Bar chart: claims per day (two bars per day, twin axes) ----
+    x = list(range(len(dates)))
+    width = 0.4
+    ax1.bar([i - width / 2 for i in x], drb_vals, width=width, color=DRB_COLOR, label="DRB")
+    ax2 = ax1.twinx()
+    ax2.bar([i + width / 2 for i in x], weth_vals, width=width, color=WETH_COLOR, label="WETH")
+
+    ax1.set_title(f"Fees claimed per day — last {days}d", fontsize=16, fontweight="bold")
+    ax1.set_ylabel("DRB", color=DRB_COLOR, fontweight="bold")
+    ax2.set_ylabel("WETH", color=WETH_COLOR, fontweight="bold")
+    ax1.tick_params(axis="y", labelcolor=DRB_COLOR)
+    ax2.tick_params(axis="y", labelcolor=WETH_COLOR)
+    ax1.yaxis.set_major_formatter(FuncFormatter(lambda v, _: _fmt_big(v)))
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+
+    step = max(1, len(dates) // 10)
+    ax1.set_xticks(x[::step])
+    ax1.set_xticklabels([d.strftime("%d %b") for d in dates][::step], rotation=45, ha="right", fontsize=9)
+    ax1.grid(axis="y", alpha=0.22)
+    ax1.set_axisbelow(True)
+    ax1.set_ylim(bottom=0)
+    ax2.set_ylim(bottom=0)
+    ax1.legend(
+        handles=[Patch(color=DRB_COLOR, label="DRB"), Patch(color=WETH_COLOR, label="WETH")],
+        loc="upper left",
+        frameon=False,
+    )
+
+    # ---- Area chart: DRB accumulating in the wallet ----
+    series = _drb_balance_series(drb_txs)
+    start_ts = int((now_utc - timedelta(days=days)).timestamp())
+
+    bal_at_start = 0.0
+    for ts, bal in series:
+        if ts < start_ts:
+            bal_at_start = bal
+        else:
+            break
+
+    pts = [(ts, bal) for ts, bal in series if ts >= start_ts]
+    xs = [datetime.fromtimestamp(start_ts, tz=timezone.utc)]
+    ys = [bal_at_start]
+    for ts, bal in pts:
+        xs.append(datetime.fromtimestamp(ts, tz=timezone.utc))
+        ys.append(bal)
+    xs.append(now_utc)
+    ys.append(ys[-1])
+
+    ax3.fill_between(xs, ys, color=DRB_COLOR, alpha=0.15)
+    ax3.plot(xs, ys, color=DRB_COLOR, linewidth=2)
+    ax3.set_title("DRB accumulated in Grok Wallet", fontsize=16, fontweight="bold")
+    ax3.yaxis.set_major_formatter(FuncFormatter(lambda v, _: _fmt_big(v)))
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax3.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=10))
+    for lbl in ax3.get_xticklabels():
+        lbl.set_rotation(45)
+        lbl.set_ha("right")
+    ax3.grid(axis="y", alpha=0.22)
+    ax3.set_axisbelow(True)
+    ax3.set_ylim(bottom=0)
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+
+    return buf, sum(drb_vals), sum(weth_vals)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    days = _parse_stats_period(context.args)
+
+    try:
+        buf, drb_total, weth_total = await asyncio.get_event_loop().run_in_executor(
+            None, generate_stats_chart, days
+        )
+        caption = (
+            f"📊 <b>Claim stats — last {days} days</b>\n"
+            f"Total claimed: <b>{_fmt_drb_millions(drb_total)} DRB</b> · <b>{_fmt_weth(weth_total)} WETH</b>"
+        )
+        await msg.reply_photo(photo=buf, caption=caption, parse_mode="HTML")
+    except Exception as e:
+        err = repr(e)
+        print("stats_command error:", err)
+        if ADMIN_ID > 0:
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"stats_command error: {err}")
+            except Exception:
+                pass
+        await msg.reply_text("Error building stats")
+
+
+# ================= BIGGEST BUYS (/buys) =================
+
+BUYS_DEFAULT_DAYS = 7
+BUYS_TOP_N = 5
+BASE_BLOCKS_PER_DAY = 43200  # ~2s per block
+
+_POOL_CACHE = {"ts": 0, "data": None}
+
+
+def _get_main_pool():
+    """Main DRB pool on Base from DexScreener (highest liquidity). Cached 1h."""
+    now = time.time()
+    if _POOL_CACHE["data"] and (now - _POOL_CACHE["ts"]) < 3600:
+        return _POOL_CACHE["data"]
+
+    r = requests.get(DEXSCREENER_TOKEN_URL + DRB_TOKEN, headers=UA_HEADERS, timeout=20)
+    r.raise_for_status()
+    pairs = r.json().get("pairs") or []
+
+    best = None
+    best_liq = -1.0
+    for p in pairs:
+        try:
+            if (p.get("chainId") or "").lower() != "base":
+                continue
+            liq = float((p.get("liquidity") or {}).get("usd") or 0)
+            if liq > best_liq and p.get("pairAddress"):
+                best = p
+                best_liq = liq
+        except Exception:
+            continue
+
+    if not best:
+        return None
+
+    quote = best.get("quoteToken") or {}
+    data = {
+        "pair": str(best["pairAddress"]).lower(),
+        "quote": str(quote.get("address") or WETH_TOKEN).lower(),
+        "quote_symbol": quote.get("symbol") or "WETH",
+    }
+    _POOL_CACHE["ts"] = now
+    _POOL_CACHE["data"] = data
+    return data
+
+
+def _short_addr_buys(a: str) -> str:
+    a = (a or "").strip()
+    if len(a) <= 16:
+        return a
+    return f"{a[:8]}...{a[-8:]}"
+
+
+def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
+    """Build the 'Biggest Buys' HTML message for the last `days` days."""
+    pool = _get_main_pool()
+    if not pool:
+        raise RuntimeError("Could not resolve DRB pool from DexScreener")
+
+    pool_addr = pool["pair"]
+    quote_token = pool["quote"]
+    quote_sym = pool["quote_symbol"]
+
+    latest_block = int(_rpc_call("eth_blockNumber", []), 16)
+    start_block = max(0, latest_block - days * BASE_BLOCKS_PER_DAY - 2000)
+    cutoff_ts = time.time() - days * 86400
+
+    drb_txs = fetch_token_transfers(DRB_TOKEN, pool_addr, startblock=start_block)
+    quote_txs = fetch_token_transfers(quote_token, pool_addr, startblock=start_block)
+
+    # Quote token paid INTO the pool per tx hash (what the buyer paid)
+    paid = {}
+    for t in quote_txs:
+        if (t.get("to") or "").lower() == pool_addr:
+            h = t.get("hash")
+            paid[h] = paid.get(h, 0.0) + _tx_amount(t)
+
+    # DRB sent OUT of the pool = buys (exclude fee collections to locker/wallet)
+    exclude_to = {
+        pool_addr,
+        CLAIM_CONTRACT.lower(),
+        CLAIM_RECIPIENT.lower(),
+        GROK_WALLET.lower(),
+        "0x0000000000000000000000000000000000000000",
+    }
+    by_hash = {}
+    for t in drb_txs:
+        if (t.get("from") or "").lower() != pool_addr:
+            continue
+        to = (t.get("to") or "").lower()
+        if to in exclude_to:
+            continue
+        ts = int(t.get("timeStamp") or 0)
+        if ts < cutoff_ts:
+            continue
+        h = t.get("hash")
+        b = by_hash.get(h)
+        amt = _tx_amount(t)
+        if b:
+            b["drb"] += amt
+        else:
+            by_hash[h] = {"hash": h, "to": to, "drb": amt, "quote": paid.get(h, 0.0), "ts": ts}
+
+    buys = list(by_hash.values())
+
+    # Prices for USD valuation
+    try:
+        quote_price = fetch_price_usd(quote_token)
+    except Exception:
+        quote_price = 0.0
+    try:
+        drb_price = fetch_price_usd(DRB_TOKEN)
+    except Exception:
+        drb_price = 0.0
+
+    for b in buys:
+        if b["quote"] > 0 and quote_price > 0:
+            b["usd"] = b["quote"] * quote_price
+        else:
+            b["usd"] = b["drb"] * drb_price
+
+    buys.sort(key=lambda b: b["usd"], reverse=True)
+    top = buys[:top_n]
+
+    period_label = f"Last {days // 7}w" if days % 7 == 0 and days > 7 else f"Last {days}d"
+
+    if not top:
+        return f"🏆 <b>Biggest Buys — {period_label}</b>\n\nNo buys found in this period."
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    lines = [f"🏆 <b>Biggest Buys — {period_label}</b>"]
+
+    for i, b in enumerate(top):
+        wallet_url = f"https://basescan.org/address/{b['to']}"
+        tx_url = f"https://basescan.org/tx/{b['hash']}"
+        quote_str = f" ({_fmt_sig(b['quote'])} {quote_sym})" if b["quote"] > 0 else ""
+        lines.append("")
+        lines.append(medals[i] if i < len(medals) else f"{i + 1}.")
+        lines.append(f"💲 | <b>${b['usd']:,.2f}</b>{quote_str}")
+        lines.append(f"🪙 | Got: <b>{_fmt_big(b['drb'])} DRB</b>")
+        lines.append(f'👛 | <a href="{wallet_url}">{_short_addr_buys(b["to"])}</a> | <a href="{tx_url}">Txn</a>')
+
+    top_total = sum(b["usd"] for b in top)
+    over_1k = sum(1 for b in buys if b["usd"] >= 1000)
+    summary = f"📊 | {len(buys)} buys"
+    if over_1k:
+        summary += f" · {over_1k} over $1K"
+    summary += f" | Top {len(top)} total: <b>${top_total:,.2f}</b>"
+    lines.append("")
+    lines.append(summary)
+
+    return "\n".join(lines)
+
+
+async def buys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    days = _parse_stats_period(context.args, default_days=BUYS_DEFAULT_DAYS)
+
+    try:
+        text = await asyncio.get_event_loop().run_in_executor(None, build_biggest_buys_text, days)
+        await msg.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        err = repr(e)
+        print("buys_command error:", err)
+        if ADMIN_ID > 0:
+            try:
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"buys_command error: {err}")
+            except Exception:
+                pass
+        await msg.reply_text("Error building biggest buys")
+
+
 # ================= CLAIM FEES =================
 
 CLAIM_COOLDOWN_SECONDS = 8 * 3600  # 8 hours between claims
@@ -888,6 +1294,94 @@ async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return member.status in ("administrator", "creator")
     except Exception:
         return False
+
+
+def _transfer_topic_hex() -> str:
+    t = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+    return t[2:] if t.startswith("0x") else t
+
+
+def _estimate_pending_rewards():
+    """
+    Simulate the claimRewards tx (alchemy_simulateExecution) and parse the Transfer
+    logs to estimate how much WETH/DRB a claim would send to the Grok wallet right now.
+    Returns dict {weth, drb, weth_usd, drb_usd} or None if simulation is unavailable.
+    """
+    try:
+        selector = Web3.keccak(text="claimRewards(address)")[:4].hex()
+        if not selector.startswith("0x"):
+            selector = "0x" + selector
+        data = selector + _pad32_hex_address(DRB_TOKEN)
+
+        from_addr = GROK_WALLET
+        if CLAIM_PRIVATE_KEY:
+            try:
+                from_addr = Web3().eth.account.from_key(CLAIM_PRIVATE_KEY).address
+            except Exception:
+                pass
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "alchemy_simulateExecution",
+            "params": [{
+                "from": from_addr,
+                "to": Web3.to_checksum_address(CLAIM_CONTRACT),
+                "value": "0x0",
+                "data": data,
+            }],
+        }
+        r = requests.post(ALCHEMY_RPC_URL, json=payload, headers=UA_HEADERS, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        if "error" in j:
+            raise RuntimeError(str(j["error"]))
+        logs = (j.get("result") or {}).get("logs") or []
+
+        transfer_topic = _transfer_topic_hex()
+        weth_amt = 0.0
+        drb_amt = 0.0
+
+        for log in logs:
+            topics = log.get("topics") or []
+            if len(topics) < 3:
+                continue
+            t0 = str(topics[0]).lower()
+            t0 = t0[2:] if t0.startswith("0x") else t0
+            if t0 != transfer_topic:
+                continue
+
+            token_addr = str(log.get("address") or "").lower()
+            if token_addr not in (WETH_TOKEN.lower(), DRB_TOKEN.lower()):
+                continue
+
+            t2 = str(topics[2]).lower()
+            t2 = t2[2:] if t2.startswith("0x") else t2
+            to_addr = "0x" + t2[-40:]
+            if to_addr != GROK_WALLET.lower():
+                continue
+
+            raw_value = int(str(log.get("data") or "0x0"), 16)
+
+            if token_addr == WETH_TOKEN.lower():
+                weth_amt += raw_value / 10 ** 18
+            else:
+                drb_amt += raw_value / 10 ** 18
+
+        out = {"weth": weth_amt, "drb": drb_amt, "weth_usd": None, "drb_usd": None}
+        try:
+            out["weth_usd"] = weth_amt * fetch_price_usd(WETH_TOKEN)
+        except Exception:
+            pass
+        try:
+            out["drb_usd"] = drb_amt * fetch_price_usd(DRB_TOKEN)
+        except Exception:
+            pass
+        return out
+
+    except Exception as e:
+        print("claim preview simulation error:", repr(e))
+        return None
 
 
 def _do_claim_tx() -> dict:
@@ -1043,14 +1537,32 @@ async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Estimate how much a claim would collect right now (tx simulation)
+    loading = await msg.reply_text("🔎 Estimating pending fees...")
+    est = await asyncio.get_event_loop().run_in_executor(None, _estimate_pending_rewards)
+
+    if est and (est["weth"] > 0 or est["drb"] > 0):
+        weth_usd = f" (~{_fmt_int_usd(est['weth_usd'])})" if est.get("weth_usd") else ""
+        drb_usd = f" (~{_fmt_int_usd(est['drb_usd'])})" if est.get("drb_usd") else ""
+        est_lines = (
+            "Estimated rewards to collect:\n"
+            f"• <b>{_fmt_weth(est['weth'])} WETH</b>{weth_usd}\n"
+            f"• <b>{_fmt_drb_millions(est['drb'])} DRB</b>{drb_usd}\n\n"
+        )
+    elif est:
+        est_lines = "Estimated rewards to collect: <i>nothing pending right now</i>\n\n"
+    else:
+        est_lines = "⚠️ Could not estimate pending rewards.\n\n"
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ CLAIM", callback_data="claim_confirm"),
             InlineKeyboardButton("❌ CANCEL", callback_data="claim_cancel"),
         ]
     ])
-    await msg.reply_text(
+    await loading.edit_text(
         "💰 <b>Claim Trading Fees</b>\n\n"
+        + est_lines +
         "Do you want to claim the accumulated trading fees from the contract?\n\n"
         "This will send a transaction on Base mainnet.",
         parse_mode="HTML",
@@ -1129,6 +1641,8 @@ def main():
 
     app.add_handler(CommandHandler("grok", grok_command))
     app.add_handler(CommandHandler("grok2", grok2_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("buys", buys_command))
     app.add_handler(CommandHandler("claim", claim_command))
     app.add_handler(CallbackQueryHandler(claim_callback, pattern="^claim_"))
     app.add_handler(MessageHandler(filters.ALL, _count_message), group=1)
