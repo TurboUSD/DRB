@@ -126,7 +126,17 @@ def erc20_balance_of(token: str, wallet: str) -> int:
     return int(_eth_call(token, data), 16)
 
 
+# Price cache (5 min) — shared by /claim estimate, /buys and balances
+_PRICE_CACHE = {}
+_PRICE_CACHE_TTL = 300
+
+
 def fetch_price_usd(token: str) -> float:
+    now = time.time()
+    c = _PRICE_CACHE.get(token.lower())
+    if c and (now - c["ts"]) < _PRICE_CACHE_TTL:
+        return c["price"]
+
     r = requests.get(DEXSCREENER_TOKEN_URL + token, headers=UA_HEADERS, timeout=20)
     r.raise_for_status()
     pairs = r.json().get("pairs") or []
@@ -146,6 +156,7 @@ def fetch_price_usd(token: str) -> float:
     if best_price is None:
         raise RuntimeError("No priceUsd found")
 
+    _PRICE_CACHE[token.lower()] = {"ts": now, "price": best_price}
     return best_price
 
 
@@ -1001,6 +1012,11 @@ def fetch_token_transfers(token: str, wallet: str, startblock: int = 0) -> list:
         unique.append(t)
     unique.sort(key=lambda t: int(t.get("timeStamp") or 0))
 
+    # Prune expired cache entries so it doesn't grow forever
+    if len(_TRANSFERS_CACHE) > 40:
+        for k in [k for k, v in _TRANSFERS_CACHE.items() if (now - v["ts"]) > _TRANSFERS_CACHE_TTL]:
+            _TRANSFERS_CACHE.pop(k, None)
+
     _TRANSFERS_CACHE[key] = {"ts": now, "data": unique}
     return unique
 
@@ -1062,9 +1078,19 @@ def _drb_balance_series(txs: list) -> list:
     return series
 
 
+# Rendered /stats result cache: days -> {ts, png, drb_total, weth_total} (5 min)
+_STATS_RESULT_CACHE = {}
+_STATS_RESULT_TTL = 300
+
+
 def generate_stats_chart(days: int):
     """Build the /stats image: daily claims bars (DRB + WETH) and DRB accumulation area chart.
-    Returns (png_buffer, drb_total_claimed, weth_total_claimed)."""
+    Returns (png_buffer, drb_total_claimed, weth_total_claimed). Result cached 5 min per period."""
+    now = time.time()
+    c = _STATS_RESULT_CACHE.get(days)
+    if c and (now - c["ts"]) < _STATS_RESULT_TTL:
+        return BytesIO(c["png"]), c["drb_total"], c["weth_total"], c["growth"], c["growth_pct"]
+
     drb_txs = fetch_token_transfers(DRB_TOKEN, GROK_WALLET)
     weth_txs = fetch_token_transfers(WETH_TOKEN, GROK_WALLET)
 
@@ -1140,10 +1166,22 @@ def generate_stats_chart(days: int):
 
     buf = BytesIO()
     plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    buf.seek(0)
     plt.close(fig)
 
-    return buf, sum(drb_vals), sum(weth_vals)
+    # Wallet DRB growth over the selected period
+    growth = ys[-1] - bal_at_start
+    growth_pct = (growth / bal_at_start * 100.0) if bal_at_start > 0 else None
+
+    png = buf.getvalue()
+    _STATS_RESULT_CACHE[days] = {
+        "ts": now,
+        "png": png,
+        "drb_total": sum(drb_vals),
+        "weth_total": sum(weth_vals),
+        "growth": growth,
+        "growth_pct": growth_pct,
+    }
+    return BytesIO(png), sum(drb_vals), sum(weth_vals), growth, growth_pct
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1154,12 +1192,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = _parse_stats_period(context.args)
 
     try:
-        buf, drb_total, weth_total = await asyncio.get_event_loop().run_in_executor(
+        buf, drb_total, weth_total, growth, growth_pct = await asyncio.get_event_loop().run_in_executor(
             None, generate_stats_chart, days
         )
+        sign = "+" if growth >= 0 else "-"
+        pct_str = f" ({growth_pct:+.1f}%)" if growth_pct is not None else ""
         caption = (
             f"📊 <b>Claim stats — last {days} days</b>\n"
-            f"Total claimed: <b>{_fmt_drb_millions(drb_total)} DRB</b> · <b>{_fmt_weth(weth_total)} WETH</b>"
+            f"Total claimed: <b>{_fmt_drb_millions(drb_total)} DRB</b> · <b>{_fmt_weth(weth_total)} WETH</b>\n"
+            f"Grok Wallet: <b>{sign}{_fmt_big(abs(growth))} DRB</b>{pct_str}"
         )
         await msg.reply_photo(photo=buf, caption=caption, parse_mode="HTML")
     except Exception as e:
@@ -1226,8 +1267,18 @@ def _short_addr_buys(a: str) -> str:
     return f"{a[:8]}...{a[-8:]}"
 
 
+# Rendered /buys result cache: days -> {ts, text} (5 min)
+_BUYS_RESULT_CACHE = {}
+_BUYS_RESULT_TTL = 300
+
+
 def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
-    """Build the 'Biggest Buys' HTML message for the last `days` days."""
+    """Build the 'Biggest Buys' HTML message for the last `days` days. Result cached 5 min."""
+    now = time.time()
+    c = _BUYS_RESULT_CACHE.get(days)
+    if c and (now - c["ts"]) < _BUYS_RESULT_TTL:
+        return c["text"]
+
     pool = _get_main_pool()
     if not pool:
         raise RuntimeError("Could not resolve DRB pool from DexScreener")
@@ -1238,6 +1289,9 @@ def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
 
     latest_block = int(_rpc_call("eth_blockNumber", []), 16)
     start_block = max(0, latest_block - days * BASE_BLOCKS_PER_DAY - 2000)
+    # Round down so the transfers-cache key stays stable between calls
+    # (otherwise every call gets a new startblock and never hits the cache)
+    start_block -= start_block % 50_000
     cutoff_ts = time.time() - days * 86400
 
     drb_txs = fetch_token_transfers(DRB_TOKEN, pool_addr, startblock=start_block)
@@ -1300,7 +1354,9 @@ def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
     period_label = f"Last {days // 7}w" if days % 7 == 0 and days > 7 else f"Last {days}d"
 
     if not top:
-        return f"🏆 <b>Biggest Buys — {period_label}</b>\n\nNo buys found in this period."
+        text = f"🏆 <b>Biggest Buys — {period_label}</b>\n\nNo buys found in this period."
+        _BUYS_RESULT_CACHE[days] = {"ts": now, "text": text}
+        return text
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     lines = [f"🏆 <b>Biggest Buys — {period_label}</b>"]
@@ -1316,15 +1372,19 @@ def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
         lines.append(f'👛 | <a href="{wallet_url}">{_short_addr_buys(b["to"])}</a> | <a href="{tx_url}">Txn</a>')
 
     top_total = sum(b["usd"] for b in top)
+    total_drb_bought = sum(b["drb"] for b in buys)
     over_1k = sum(1 for b in buys if b["usd"] >= 1000)
     summary = f"📊 | {len(buys)} buys"
     if over_1k:
         summary += f" · {over_1k} over $1K"
+    summary += f" · <b>{_fmt_big(total_drb_bought)} DRB</b> bought"
     summary += f" | Top {len(top)} total: <b>${top_total:,.2f}</b>"
     lines.append("")
     lines.append(summary)
 
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    _BUYS_RESULT_CACHE[days] = {"ts": now, "text": text}
+    return text
 
 
 async def buys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1380,12 +1440,21 @@ def _transfer_topic_hex() -> str:
     return t[2:] if t.startswith("0x") else t
 
 
+_CLAIM_EST_CACHE = {"ts": 0, "data": None}
+_CLAIM_EST_TTL = 180  # 3 min
+
+
 def _estimate_pending_rewards():
     """
     Simulate the claimRewards tx (eth_simulateV1) and parse the Transfer logs
     to estimate how much WETH/DRB a claim would send to the Grok wallet right now.
     Returns dict {weth, drb, weth_usd, drb_usd} or None if simulation is unavailable.
+    Cached 3 min; invalidated after a successful claim.
     """
+    now = time.time()
+    if _CLAIM_EST_CACHE["data"] is not None and (now - _CLAIM_EST_CACHE["ts"]) < _CLAIM_EST_TTL:
+        return _CLAIM_EST_CACHE["data"]
+
     try:
         selector = Web3.keccak(text="claimRewards(address)")[:4].hex()
         if not selector.startswith("0x"):
@@ -1453,6 +1522,8 @@ def _estimate_pending_rewards():
             out["drb_usd"] = drb_amt * fetch_price_usd(DRB_TOKEN)
         except Exception:
             pass
+        _CLAIM_EST_CACHE["ts"] = now
+        _CLAIM_EST_CACHE["data"] = out
         return out
 
     except Exception as e:
@@ -1675,6 +1746,10 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global _last_claim_ts, _last_claim_tx
         _last_claim_ts = time.time()
         _last_claim_tx = result["tx_hash"]
+
+        # Invalidate the pending-rewards estimate cache (it just changed)
+        _CLAIM_EST_CACHE["ts"] = 0
+        _CLAIM_EST_CACHE["data"] = None
 
         text = (
             "✅ <b>Fees claimed successfully!</b>\n\n"
