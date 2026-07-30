@@ -875,14 +875,65 @@ STATS_DEFAULT_DAYS = 30
 STATS_MAX_DAYS = 365
 
 
-def fetch_token_transfers(token: str, wallet: str, startblock: int = 0) -> list:
-    """All ERC-20 transfers of `token` involving `wallet` on Base (Etherscan v2, cached 15 min)."""
-    key = (token.lower(), wallet.lower(), int(startblock))
-    now = time.time()
-    c = _TRANSFERS_CACHE.get(key)
-    if c and (now - c["ts"]) < _TRANSFERS_CACHE_TTL:
-        return c["data"]
+def _alchemy_get_transfers(token: str, wallet: str, startblock: int = 0) -> list:
+    """Fetch ERC-20 transfers of `token` involving `wallet` via alchemy_getAssetTransfers.
+    Returns Etherscan-style dicts: {hash, from, to, value, tokenDecimal, timeStamp, blockNumber, uniqueId}."""
+    out = []
+    for direction in ("toAddress", "fromAddress"):
+        page_key = None
+        for _ in range(25):  # safety bound
+            params = {
+                "fromBlock": hex(int(startblock)),
+                "toBlock": "latest",
+                direction: wallet,
+                "contractAddresses": [token],
+                "category": ["erc20"],
+                "withMetadata": True,
+                "maxCount": "0x3e8",  # 1000
+                "order": "asc",
+            }
+            if page_key:
+                params["pageKey"] = page_key
 
+            payload = {"jsonrpc": "2.0", "id": 1, "method": "alchemy_getAssetTransfers", "params": [params]}
+            r = requests.post(ALCHEMY_RPC_URL, json=payload, headers=UA_HEADERS, timeout=30)
+            r.raise_for_status()
+            j = r.json()
+            if "error" in j:
+                raise RuntimeError(str(j["error"]))
+            res = j.get("result") or {}
+
+            for t in res.get("transfers") or []:
+                raw = t.get("rawContract") or {}
+                try:
+                    value = int(str(raw.get("value") or "0x0"), 16)
+                    dec = int(str(raw.get("decimal") or "0x12"), 16)
+                except Exception:
+                    continue
+                ts_iso = ((t.get("metadata") or {}).get("blockTimestamp") or "").replace("Z", "+00:00")
+                try:
+                    ts = int(datetime.fromisoformat(ts_iso).timestamp())
+                except Exception:
+                    continue
+                out.append({
+                    "hash": t.get("hash"),
+                    "from": (t.get("from") or "").lower(),
+                    "to": (t.get("to") or "").lower(),
+                    "value": str(value),
+                    "tokenDecimal": str(dec),
+                    "timeStamp": str(ts),
+                    "blockNumber": str(int(str(t.get("blockNum") or "0x0"), 16)),
+                    "uniqueId": t.get("uniqueId"),
+                })
+
+            page_key = res.get("pageKey")
+            if not page_key:
+                break
+    return out
+
+
+def _etherscan_get_transfers(token: str, wallet: str, startblock: int = 0) -> list:
+    """Fallback: Etherscan v2 tokentx (requires an API key for Base)."""
     txs = []
     startblock = int(startblock)
     for _ in range(20):  # safety bound
@@ -906,21 +957,49 @@ def fetch_token_transfers(token: str, wallet: str, startblock: int = 0) -> list:
         j = r.json() if r.content else {}
         result = j.get("result")
         if not isinstance(result, list):
-            break
+            raise RuntimeError(f"etherscan tokentx: {str(result)[:120]}")
         txs.extend(result)
         if len(result) < 10000:
             break
         startblock = int(result[-1]["blockNumber"]) + 1
+    return txs
 
-    # Dedupe possible duplicates at pagination borders
+
+def fetch_token_transfers(token: str, wallet: str, startblock: int = 0) -> list:
+    """All ERC-20 transfers of `token` involving `wallet` on Base, cached 15 min.
+    Primary source: Alchemy asset transfers (no API key needed).
+    Fallback: Etherscan v2 (only useful if ETHERSCAN_APIKEY is set)."""
+    key = (token.lower(), wallet.lower(), int(startblock))
+    now = time.time()
+    c = _TRANSFERS_CACHE.get(key)
+    if c and (now - c["ts"]) < _TRANSFERS_CACHE_TTL:
+        return c["data"]
+
+    txs = None
+    try:
+        txs = _alchemy_get_transfers(token, wallet, startblock)
+    except Exception as e:
+        print("alchemy transfers error:", repr(e))
+
+    if txs is None and ETHERSCAN_APIKEY:
+        try:
+            txs = _etherscan_get_transfers(token, wallet, startblock)
+        except Exception as e:
+            print("etherscan transfers error:", repr(e))
+
+    if txs is None:
+        raise RuntimeError("No transfer data source available (Alchemy failed, no ETHERSCAN_APIKEY)")
+
+    # Dedupe (the two direction queries can overlap on self-transfers; pagination borders too)
     seen = set()
     unique = []
     for t in txs:
-        k = (t.get("hash"), t.get("from"), t.get("to"), t.get("value"), t.get("timeStamp"))
+        k = t.get("uniqueId") or (t.get("hash"), t.get("from"), t.get("to"), t.get("value"), t.get("timeStamp"))
         if k in seen:
             continue
         seen.add(k)
         unique.append(t)
+    unique.sort(key=lambda t: int(t.get("timeStamp") or 0))
 
     _TRANSFERS_CACHE[key] = {"ts": now, "data": unique}
     return unique
@@ -1303,8 +1382,8 @@ def _transfer_topic_hex() -> str:
 
 def _estimate_pending_rewards():
     """
-    Simulate the claimRewards tx (alchemy_simulateExecution) and parse the Transfer
-    logs to estimate how much WETH/DRB a claim would send to the Grok wallet right now.
+    Simulate the claimRewards tx (eth_simulateV1) and parse the Transfer logs
+    to estimate how much WETH/DRB a claim would send to the Grok wallet right now.
     Returns dict {weth, drb, weth_usd, drb_usd} or None if simulation is unavailable.
     """
     try:
@@ -1320,23 +1399,20 @@ def _estimate_pending_rewards():
             except Exception:
                 pass
 
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "alchemy_simulateExecution",
-            "params": [{
+        # eth_simulateV1 works on both Alchemy and the public Base RPC and returns logs
+        result = _rpc_call("eth_simulateV1", [
+            {"blockStateCalls": [{"calls": [{
                 "from": from_addr,
                 "to": Web3.to_checksum_address(CLAIM_CONTRACT),
-                "value": "0x0",
                 "data": data,
-            }],
-        }
-        r = requests.post(ALCHEMY_RPC_URL, json=payload, headers=UA_HEADERS, timeout=20)
-        r.raise_for_status()
-        j = r.json()
-        if "error" in j:
-            raise RuntimeError(str(j["error"]))
-        logs = (j.get("result") or {}).get("logs") or []
+            }]}]},
+            "latest",
+        ])
+        call = ((result or [{}])[0].get("calls") or [{}])[0]
+        status = str(call.get("status") or "").lower()
+        if status not in ("0x1", "1"):
+            raise RuntimeError(f"simulation reverted: {call.get('error')}")
+        logs = call.get("logs") or []
 
         transfer_topic = _transfer_topic_hex()
         weth_amt = 0.0
