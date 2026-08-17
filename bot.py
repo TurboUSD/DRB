@@ -31,7 +31,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 ETHERSCAN_APIKEY = os.environ.get("ETHERSCAN_APIKEY", "").strip() or os.environ.get("BASESCAN_API_KEY", "").strip()
 
 # Alchemy RPC (default Scaffold-ETH 2 key) with Base mainnet fallback
-ALCHEMY_RPC_URL = "https://base-mainnet.g.alchemy.com/v2/8GVG8WjDs-sGFRr6Rm839"
+ALCHEMY_RPC_URL = os.environ.get("RPC_URL", "").strip() or "https://base-mainnet.g.alchemy.com/v2/8GVG8WjDs-sGFRr6Rm839"
 BASE_FALLBACK_RPC_URL = "https://mainnet.base.org"
 BASE_RPC_URL = ALCHEMY_RPC_URL  # primary
 
@@ -117,8 +117,21 @@ def _eth_call(to_addr: str, data: str) -> str:
     return _rpc_call("eth_call", [{"to": to_addr, "data": data}, "latest"])
 
 
+# Known token decimals; unknown tokens fall back to one eth_call cached for the process lifetime
+_DECIMALS_CACHE = {
+    DRB_TOKEN.lower(): 18,
+    WETH_TOKEN.lower(): 18,
+    USDC_TOKEN.lower(): 6,
+}
+
+
 def erc20_decimals(token: str) -> int:
-    return int(_eth_call(token, "0x313ce567"), 16)
+    key = token.lower()
+    dec = _DECIMALS_CACHE.get(key)
+    if dec is None:
+        dec = int(_eth_call(token, "0x313ce567"), 16)
+        _DECIMALS_CACHE[key] = dec
+    return dec
 
 
 def erc20_balance_of(token: str, wallet: str) -> int:
@@ -505,62 +518,6 @@ def fetch_balances_and_values():
     }
 
 
-# ================= FEES =================
-
-def _parse_next_data(html: str):
-    m = re.search(r'id="__NEXT_DATA__".*?>(.*?)</script>', html, re.S)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(1))
-    except Exception:
-        return None
-
-
-def _deep_find_first_usd(obj):
-    if isinstance(obj, dict):
-        for v in obj.values():
-            r = _deep_find_first_usd(v)
-            if r:
-                return r
-    elif isinstance(obj, list):
-        for it in obj:
-            r = _deep_find_first_usd(it)
-            if r:
-                return r
-    elif isinstance(obj, str):
-        m = re.search(r"\$[\d\.,]+", obj)
-        if m:
-            return m.group(0)
-    return None
-
-
-def fetch_historical_fees_claimed():
-    try:
-        r = requests.get(GROK_WALLET_URL, headers=UA_HEADERS, timeout=20)
-        r.raise_for_status()
-        html = r.text or ""
-
-        next_data = _parse_next_data(html)
-        if next_data:
-            usd = _deep_find_first_usd(next_data)
-            if usd:
-                return usd
-
-        m = re.search(
-            r'(\$[\d\.,]+)\s*Historical\s+Fees\s+Claimed',
-            html,
-            re.IGNORECASE,
-        )
-        if m:
-            return m.group(1)
-
-    except Exception:
-        pass
-
-    return None
-
-
 # ================= DONUT IMAGE (existing /grok) =================
 
 def generate_balance_donut(
@@ -820,8 +777,6 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             usdc_amount_float=b["USDC"]["amount_float"],
         )
 
-        fees = fetch_historical_fees_claimed()
-
         caption = make_balance_table_caption(
             drb_amount_float=b["DRB"]["amount_float"],
             drb_usd_str=b["DRB"]["usd"],
@@ -831,7 +786,7 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             eth_usd_str=b["ETH"]["usd"],
             usdc_amount_str=b["USDC"]["amount"],
             usdc_usd_str=b["USDC"]["usd"],
-            fees=fees,
+            fees=None,
         )
 
         await msg.reply_photo(photo=donut, caption=caption, parse_mode="HTML")
@@ -1021,6 +976,101 @@ def fetch_token_transfers(token: str, wallet: str, startblock: int = 0) -> list:
     return unique
 
 
+# Incremental transfer cache for /stats: history never expires; only new blocks are fetched.
+_INCR_TRANSFERS_CACHE = {}
+_INCR_TRANSFERS_TTL = 900  # refresh newest blocks at most every 15 min
+_INCR_TRANSFERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transfers_cache.json")
+_INCR_REORG_OVERLAP = 50  # re-scan a few blocks to survive shallow reorgs
+
+
+def _transfer_key(t: dict):
+    return t.get("uniqueId") or "|".join(
+        str(t.get(k) or "") for k in ("hash", "from", "to", "value", "timeStamp")
+    )
+
+
+def _incr_cache_load():
+    if _INCR_TRANSFERS_CACHE.get("_loaded"):
+        return
+    _INCR_TRANSFERS_CACHE["_loaded"] = True
+    try:
+        with open(_INCR_TRANSFERS_FILE, "r") as f:
+            data = json.load(f)
+        for k, v in data.items():
+            _INCR_TRANSFERS_CACHE[k] = {
+                "transfers": v.get("transfers") or [],
+                "last_block": int(v.get("last_block") or 0),
+                "ts": 0.0,
+            }
+    except Exception:
+        pass
+
+
+def _incr_cache_save():
+    try:
+        data = {
+            k: {"transfers": v["transfers"], "last_block": v["last_block"]}
+            for k, v in _INCR_TRANSFERS_CACHE.items()
+            if isinstance(v, dict) and "transfers" in v
+        }
+        tmp = _INCR_TRANSFERS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _INCR_TRANSFERS_FILE)
+    except Exception as e:
+        print("incremental transfer cache save error:", repr(e))
+
+
+def fetch_token_transfers_incremental(token: str, wallet: str) -> list:
+    """Full transfer history of `token` for `wallet`, kept incrementally.
+    The historical portion never expires; on refresh only blocks after the
+    last seen block are re-fetched and appended (deduped)."""
+    _incr_cache_load()
+    key = f"{token.lower()}|{wallet.lower()}"
+    now = time.time()
+    c = _INCR_TRANSFERS_CACHE.get(key)
+
+    if c and (now - c.get("ts", 0)) < _INCR_TRANSFERS_TTL:
+        return c["transfers"]
+
+    if not c or not c.get("transfers"):
+        txs = fetch_token_transfers(token, wallet, startblock=0)
+        c = {
+            "transfers": list(txs),
+            "last_block": max((int(t.get("blockNumber") or 0) for t in txs), default=0),
+            "ts": now,
+        }
+        _INCR_TRANSFERS_CACHE[key] = c
+        _incr_cache_save()
+        return c["transfers"]
+
+    try:
+        start = max(0, int(c.get("last_block") or 0) - _INCR_REORG_OVERLAP)
+        new_txs = fetch_token_transfers(token, wallet, startblock=start)
+        seen = {_transfer_key(t) for t in c["transfers"]}
+        appended = False
+        for t in new_txs:
+            k2 = _transfer_key(t)
+            if k2 in seen:
+                continue
+            seen.add(k2)
+            c["transfers"].append(t)
+            appended = True
+        if appended:
+            c["transfers"].sort(key=lambda t: int(t.get("timeStamp") or 0))
+        c["last_block"] = max(
+            int(c.get("last_block") or 0),
+            max((int(t.get("blockNumber") or 0) for t in new_txs), default=0),
+        )
+        c["ts"] = now
+        if appended:
+            _incr_cache_save()
+    except Exception as e:
+        print("incremental transfer refresh error:", repr(e))
+        c["ts"] = now  # back off; serve cached history
+    return c["transfers"]
+
+
 def _tx_amount(t: dict) -> float:
     dec = int(t.get("tokenDecimal") or 18)
     return int(t.get("value") or 0) / 10 ** dec
@@ -1091,8 +1141,8 @@ def generate_stats_chart(days: int):
     if c and (now - c["ts"]) < _STATS_RESULT_TTL:
         return BytesIO(c["png"]), c["drb_total"], c["weth_total"], c["growth"], c["growth_pct"]
 
-    drb_txs = fetch_token_transfers(DRB_TOKEN, GROK_WALLET)
-    weth_txs = fetch_token_transfers(WETH_TOKEN, GROK_WALLET)
+    drb_txs = fetch_token_transfers_incremental(DRB_TOKEN, GROK_WALLET)
+    weth_txs = fetch_token_transfers_incremental(WETH_TOKEN, GROK_WALLET)
 
     now_utc = datetime.now(timezone.utc)
     end_date = now_utc.date()
@@ -1270,6 +1320,134 @@ def _short_addr_buys(a: str) -> str:
     return f"{a[:8]}...{a[-8:]}"
 
 
+# --- Swap-event based buy scan (chunked eth_getLogs; works on any RPC provider) ---
+BUYS_MAX_DAYS = 30
+LOG_CHUNK = int(os.environ.get("LOG_CHUNK", "10000"))
+
+# Uniswap V2 / Solidly-style: Swap(address indexed sender, uint amount0In, uint amount1In, uint amount0Out, uint amount1Out, address indexed to)
+V2_SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+# Uniswap V3-style: Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)
+V3_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+
+_POOL_TOKENS_CACHE = {}
+
+
+def _pool_token0_token1(pool_addr: str):
+    """token0()/token1() of the pool via eth_call, fetched once per process."""
+    key = pool_addr.lower()
+    c = _POOL_TOKENS_CACHE.get(key)
+    if c:
+        return c
+    t0 = "0x" + _eth_call(pool_addr, "0x0dfe1681")[-40:]
+    t1 = "0x" + _eth_call(pool_addr, "0xd21220a7")[-40:]
+    c = (t0.lower(), t1.lower())
+    _POOL_TOKENS_CACHE[key] = c
+    return c
+
+
+def _topic_addr(topic) -> str:
+    t = str(topic or "").lower()
+    if t.startswith("0x"):
+        t = t[2:]
+    return "0x" + t[-40:]
+
+
+def _int256(word_hex: str) -> int:
+    v = int(word_hex, 16)
+    if v >= 2 ** 255:
+        v -= 2 ** 256
+    return v
+
+
+def _fetch_pool_swap_logs(pool_addr: str, from_block: int, to_block: int) -> list:
+    """Chunked eth_getLogs for V2/V3-style Swap events emitted by the pool."""
+    logs = []
+    start = from_block
+    while start <= to_block:
+        end = min(start + LOG_CHUNK - 1, to_block)
+        res = _rpc_call("eth_getLogs", [{
+            "address": pool_addr,
+            "fromBlock": hex(start),
+            "toBlock": hex(end),
+            "topics": [[V2_SWAP_TOPIC, V3_SWAP_TOPIC]],
+        }])
+        logs.extend(res or [])
+        start = end + 1
+    return logs
+
+
+def _pool_buys_via_swap_logs(pool_addr: str, quote_token: str, start_block: int,
+                             latest_block: int, exclude_to: set) -> list:
+    """Decode the pool's Swap events into DRB buys: [{hash, to, drb, quote, ts}, ...].
+    DEX type is detected per log by topic0 (V2/Solidly vs V3 signature)."""
+    token0, token1 = _pool_token0_token1(pool_addr)
+    drb_l = DRB_TOKEN.lower()
+    if drb_l == token0:
+        drb_is_token0 = True
+    elif drb_l == token1:
+        drb_is_token0 = False
+    else:
+        raise RuntimeError(f"DRB is not token0/token1 of pool {pool_addr}")
+
+    drb_dec = erc20_decimals(DRB_TOKEN)
+    quote_dec = erc20_decimals(quote_token)
+
+    by_hash = {}
+    for log in _fetch_pool_swap_logs(pool_addr, start_block, latest_block):
+        try:
+            topics = log.get("topics") or []
+            if len(topics) < 3:
+                continue
+            t0 = str(topics[0]).lower()
+            data = str(log.get("data") or "0x")
+            data = data[2:] if data.startswith("0x") else data
+            words = [data[i:i + 64] for i in range(0, len(data) - 63, 64)]
+
+            if t0 == V2_SWAP_TOPIC:
+                if len(words) < 4:
+                    continue
+                a0_in, a1_in, a0_out, a1_out = (int(w, 16) for w in words[:4])
+                if drb_is_token0:
+                    drb_out, quote_in = a0_out, a1_in
+                else:
+                    drb_out, quote_in = a1_out, a0_in
+                recipient = _topic_addr(topics[2])  # `to`
+            elif t0 == V3_SWAP_TOPIC:
+                if len(words) < 2:
+                    continue
+                a0 = _int256(words[0])
+                a1 = _int256(words[1])
+                drb_amt = a0 if drb_is_token0 else a1
+                quote_amt = a1 if drb_is_token0 else a0
+                # buy = pool sends DRB out (negative) and receives quote (positive)
+                drb_out = -drb_amt if drb_amt < 0 else 0
+                quote_in = quote_amt if quote_amt > 0 else 0
+                recipient = _topic_addr(topics[2])  # `recipient`
+            else:
+                continue
+
+            if drb_out <= 0:
+                continue
+            to = recipient.lower()
+            if to in exclude_to:
+                continue
+
+            h = str(log.get("transactionHash") or "")
+            drb_f = drb_out / 10 ** drb_dec
+            quote_f = quote_in / 10 ** quote_dec
+            b = by_hash.get(h)
+            if b:
+                b["drb"] += drb_f
+                b["quote"] += quote_f
+            else:
+                by_hash[h] = {"hash": h, "to": to, "drb": drb_f, "quote": quote_f,
+                              "ts": int(str(log.get("blockNumber") or "0x0"), 16)}
+        except Exception:
+            continue
+
+    return list(by_hash.values())
+
+
 # Rendered /buys result cache: days -> {ts, text} (5 min)
 _BUYS_RESULT_CACHE = {}
 _BUYS_RESULT_TTL = 300
@@ -1277,6 +1455,9 @@ _BUYS_RESULT_TTL = 300
 
 def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
     """Build the 'Biggest Buys' HTML message for the last `days` days. Result cached 5 min."""
+    capped = days > BUYS_MAX_DAYS
+    if capped:
+        days = BUYS_MAX_DAYS
     now = time.time()
     c = _BUYS_RESULT_CACHE.get(days)
     if c and (now - c["ts"]) < _BUYS_RESULT_TTL:
@@ -1291,23 +1472,7 @@ def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
     quote_sym = pool["quote_symbol"]
 
     latest_block = int(_rpc_call("eth_blockNumber", []), 16)
-    start_block = max(0, latest_block - days * BASE_BLOCKS_PER_DAY - 2000)
-    # Round down so the transfers-cache key stays stable between calls
-    # (otherwise every call gets a new startblock and never hits the cache)
-    start_block -= start_block % 50_000
-    cutoff_ts = time.time() - days * 86400
 
-    drb_txs = fetch_token_transfers(DRB_TOKEN, pool_addr, startblock=start_block)
-    quote_txs = fetch_token_transfers(quote_token, pool_addr, startblock=start_block)
-
-    # Quote token paid INTO the pool per tx hash (what the buyer paid)
-    paid = {}
-    for t in quote_txs:
-        if (t.get("to") or "").lower() == pool_addr:
-            h = t.get("hash")
-            paid[h] = paid.get(h, 0.0) + _tx_amount(t)
-
-    # DRB sent OUT of the pool = buys (exclude fee collections to locker/wallet)
     exclude_to = {
         pool_addr,
         CLAIM_CONTRACT.lower(),
@@ -1315,25 +1480,53 @@ def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
         GROK_WALLET.lower(),
         "0x0000000000000000000000000000000000000000",
     }
-    by_hash = {}
-    for t in drb_txs:
-        if (t.get("from") or "").lower() != pool_addr:
-            continue
-        to = (t.get("to") or "").lower()
-        if to in exclude_to:
-            continue
-        ts = int(t.get("timeStamp") or 0)
-        if ts < cutoff_ts:
-            continue
-        h = t.get("hash")
-        b = by_hash.get(h)
-        amt = _tx_amount(t)
-        if b:
-            b["drb"] += amt
-        else:
-            by_hash[h] = {"hash": h, "to": to, "drb": amt, "quote": paid.get(h, 0.0), "ts": ts}
 
-    buys = list(by_hash.values())
+    # Primary path: decode the pool's own Swap events via chunked eth_getLogs.
+    buys = None
+    try:
+        swap_start = max(0, latest_block - days * BASE_BLOCKS_PER_DAY)
+        buys = _pool_buys_via_swap_logs(pool_addr, quote_token, swap_start, latest_block, exclude_to)
+    except Exception as e:
+        print("swap-log buys scan failed, falling back to transfer scan:", repr(e))
+
+    if buys is None:
+        # Legacy fallback: indexer transfer scans on the pool address.
+        start_block = max(0, latest_block - days * BASE_BLOCKS_PER_DAY - 2000)
+        # Round down so the transfers-cache key stays stable between calls
+        # (otherwise every call gets a new startblock and never hits the cache)
+        start_block -= start_block % 50_000
+        cutoff_ts = time.time() - days * 86400
+
+        drb_txs = fetch_token_transfers(DRB_TOKEN, pool_addr, startblock=start_block)
+        quote_txs = fetch_token_transfers(quote_token, pool_addr, startblock=start_block)
+
+        # Quote token paid INTO the pool per tx hash (what the buyer paid)
+        paid = {}
+        for t in quote_txs:
+            if (t.get("to") or "").lower() == pool_addr:
+                h = t.get("hash")
+                paid[h] = paid.get(h, 0.0) + _tx_amount(t)
+
+        # DRB sent OUT of the pool = buys (exclude fee collections to locker/wallet)
+        by_hash = {}
+        for t in drb_txs:
+            if (t.get("from") or "").lower() != pool_addr:
+                continue
+            to = (t.get("to") or "").lower()
+            if to in exclude_to:
+                continue
+            ts = int(t.get("timeStamp") or 0)
+            if ts < cutoff_ts:
+                continue
+            h = t.get("hash")
+            b = by_hash.get(h)
+            amt = _tx_amount(t)
+            if b:
+                b["drb"] += amt
+            else:
+                by_hash[h] = {"hash": h, "to": to, "drb": amt, "quote": paid.get(h, 0.0), "ts": ts}
+
+        buys = list(by_hash.values())
 
     # Prices for USD valuation
     try:
@@ -1355,6 +1548,8 @@ def build_biggest_buys_text(days: int, top_n: int = BUYS_TOP_N) -> str:
     top = buys[:top_n]
 
     period_label = f"Last {days // 7}w" if days % 7 == 0 and days > 7 else f"Last {days}d"
+    if capped:
+        period_label += " (max 30d)"
 
     if not top:
         text = f"🏆 <b>Biggest Buys — {period_label}</b>\n\nNo buys found in this period."
