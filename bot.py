@@ -101,7 +101,7 @@ WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
 WATCH_LOG_CHUNK = int(os.environ.get("WATCH_LOG_CHUNK", "2000"))
 BUY_RECEIPT_PREFILTER_PCT = float(os.environ.get("BUY_RECEIPT_PREFILTER_PCT", "0.10"))
 DEFAULT_MIN_BUY_USD = float(os.environ.get("DEFAULT_MIN_BUY_USD", "10000"))   # used when no saved state exists
-DEFAULT_EMOJI_USD = float(os.environ.get("DEFAULT_EMOJI_USD", "250"))
+DEFAULT_EMOJI_USD = float(os.environ.get("DEFAULT_EMOJI_USD", "250"))  # $250 per emoji -> $10k = 40 emojis, 100 emojis at $25k+
 
 DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
@@ -2364,8 +2364,19 @@ def _buy_from_receipt(tx_hash: str, receipt: dict, allow_live_eth_fallback: bool
     buyer = _pick_final_buyer(tdel, exclude)
     if not buyer:
         return None
-    # Final receiver must be a person (EOA), not a contract
-    if _is_contract(buyer, block_number):
+
+    tx_from, eth_value = "", 0
+    try:
+        tx = _get_tx(tx_hash)
+        tx_from = _norm(tx.get("from", ""))
+        eth_value = int(tx.get("value", "0x0"), 16)
+    except Exception:
+        pass
+
+    # Final receiver must be a person: an EOA, or a smart-contract wallet (Safe / AA /
+    # Coinbase Smart Wallet...) that is itself the sender of the tx. Any other contract
+    # (pool, router, locker) is not a personal buy.
+    if _is_contract(buyer, block_number) and _norm(buyer) != tx_from:
         return None
 
     tokens_delta = int(tdel.get(buyer, 0))
@@ -2385,14 +2396,6 @@ def _buy_from_receipt(tx_hash: str, receipt: dict, allow_live_eth_fallback: bool
 
     spent_usd = 0.0
     eth_spent = usdc_spent = usdt_spent = weth_spent = 0.0
-
-    tx_from, eth_value = "", 0
-    try:
-        tx = _get_tx(tx_hash)
-        tx_from = _norm(tx.get("from", ""))
-        eth_value = int(tx.get("value", "0x0"), 16)
-    except Exception:
-        pass
 
     paid_with_eth = eth_value > 0
     if paid_with_eth:
@@ -2451,6 +2454,15 @@ def _sell_from_receipt(tx_hash: str, receipt: dict):
         return None
     seller = _pick_final_seller(tdel, _buy_exclude_set())
     if not seller:
+        return None
+    # The seller must be a person (EOA) or the smart wallet sending the tx. Pools,
+    # routers and PoolManagers moving DRB internally are not sellers.
+    tx_from = ""
+    try:
+        tx_from = _norm((_get_tx(tx_hash) or {}).get("from", ""))
+    except Exception:
+        pass
+    if _is_contract(seller, block_number) and _norm(seller) != tx_from:
         return None
     tokens_sold = -int(tdel.get(seller, 0)) / 10 ** erc20_decimals(DRB_TOKEN)
     if tokens_sold <= 0:
@@ -2675,6 +2687,8 @@ async def buy_monitor(app) -> None:
                         _sd = _prune_seen(list(sent_dm))
                         _update_state_fields(lambda s, _sd=_sd: s["watch"]["sent_dm"].__setitem__("buy", _sd))
                         await _send_buy_alert(app, ADMIN_ID, caption)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print("buy_monitor error:", repr(e))
         await asyncio.sleep(WATCH_POLL_SEC)
@@ -2901,7 +2915,22 @@ async def on_startup(app):
         except Exception:
             pass
     _ensure_data_dir()
-    asyncio.create_task(buy_monitor(app))
+    app.bot_data["monitor_task"] = asyncio.create_task(buy_monitor(app))
+    if ADMIN_ID > 0:
+        try:
+            await app.bot.send_message(chat_id=ADMIN_ID, text=f"ASSET_BUY={ASSET_BUY} exists={os.path.exists(ASSET_BUY)}")
+        except Exception:
+            pass
+
+
+async def on_shutdown(app):
+    t = app.bot_data.get("monitor_task")
+    if t and not t.done():
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def main():
@@ -2909,6 +2938,7 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(on_startup)
+        .post_shutdown(on_shutdown)
         .build()
     )
 
