@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
 import asyncio
 from web3 import Web3
 
@@ -82,7 +82,7 @@ CARD_W = 896
 CARD_H = 658
 
 # ---- Buy alerts (ported from the CLAWD bot) ----
-ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))  # group to post buy alerts in (0 = only DM admin)
+ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "-1002614749825"))  # DRB group (always posts here, even without saved state)
 USDT_TOKEN = "0xd9aaEC86B65D86f6A7B5B1b0c42FFA531710b6CA"
 BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -100,6 +100,8 @@ WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
 WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
 WATCH_LOG_CHUNK = int(os.environ.get("WATCH_LOG_CHUNK", "2000"))
 BUY_RECEIPT_PREFILTER_PCT = float(os.environ.get("BUY_RECEIPT_PREFILTER_PCT", "0.10"))
+DEFAULT_MIN_BUY_USD = float(os.environ.get("DEFAULT_MIN_BUY_USD", "10000"))   # used when no saved state exists
+DEFAULT_EMOJI_USD = float(os.environ.get("DEFAULT_EMOJI_USD", "100"))
 
 DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
@@ -2004,9 +2006,10 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---- State (persisted JSON) ----
 
 DEFAULT_STATE = {
-    "min_usd": {"buy": 100.0},
-    "emoji_usd": {"buy": 100.0},
+    "min_usd": {"buy": DEFAULT_MIN_BUY_USD},
+    "emoji_usd": {"buy": DEFAULT_EMOJI_USD},
     "alerts_dm": True,
+    "alert_chats": [],  # groups/channels where the bot has been added (auto-registered)
     "watch": {
         "last_scanned_block": 0,
         "seen": {"buy": []},
@@ -2039,6 +2042,8 @@ def _load_state() -> dict:
                 merged[k].update(s[k])
         if "alerts_dm" in s:
             merged["alerts_dm"] = bool(s["alerts_dm"])
+        if isinstance(s.get("alert_chats"), list):
+            merged["alert_chats"] = [int(c) for c in s["alert_chats"] if str(c).lstrip("-").isdigit()]
         w = s.get("watch") or {}
         if isinstance(w, dict):
             merged["watch"]["last_scanned_block"] = int(w.get("last_scanned_block") or 0)
@@ -2519,6 +2524,50 @@ async def _send_buy_alert(app, chat_id: int, caption: str) -> None:
         await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
 
 
+# ---- Alert chats: auto-register every group the bot is added to ----
+
+def _alert_chat_ids() -> list:
+    """Groups to post buy alerts in: auto-registered chats + ALLOWED_CHAT_ID (if set)."""
+    ids = set(_load_state().get("alert_chats") or [])
+    if ALLOWED_CHAT_ID:
+        ids.add(ALLOWED_CHAT_ID)
+    return sorted(ids)
+
+
+def _register_alert_chat(chat_id: int, add: bool = True) -> None:
+    def _m(s):
+        cur = set(int(c) for c in (s.get("alert_chats") or []))
+        if add:
+            cur.add(int(chat_id))
+        else:
+            cur.discard(int(chat_id))
+        s["alert_chats"] = sorted(cur)
+    _update_state_fields(_m)
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot added to / removed from a group -> register / unregister it for alerts."""
+    cm = update.my_chat_member
+    if not cm or not cm.chat or cm.chat.type not in ("group", "supergroup", "channel"):
+        return
+    status = cm.new_chat_member.status
+    if status in ("member", "administrator", "restricted"):
+        _register_alert_chat(cm.chat.id, True)
+        print(f"[alerts] registered chat {cm.chat.id} ({cm.chat.title})")
+    elif status in ("left", "kicked"):
+        _register_alert_chat(cm.chat.id, False)
+        print(f"[alerts] unregistered chat {cm.chat.id}")
+
+
+async def _register_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback: any message seen in a group registers that group (covers bots added before this version)."""
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        if chat.id not in set(_load_state().get("alert_chats") or []):
+            _register_alert_chat(chat.id, True)
+            print(f"[alerts] registered chat {chat.id} ({chat.title}) from message")
+
+
 # ---- Monitor loop ----
 
 def _monitor_tick_sync() -> list:
@@ -2608,9 +2657,16 @@ async def buy_monitor(app) -> None:
                 sent_dm = set(state["watch"]["sent_dm"].get("buy") or [])
                 dm_enabled = bool(state.get("alerts_dm", True)) and ADMIN_ID > 0
 
+                chats = _alert_chat_ids()
                 for uid, caption in outgoing:
-                    if ALLOWED_CHAT_ID and uid not in sent_pub:
-                        await _send_buy_alert(app, ALLOWED_CHAT_ID, caption)
+                    if chats and uid not in sent_pub:
+                        for cid in chats:
+                            try:
+                                await _send_buy_alert(app, cid, caption)
+                            except Exception as e:
+                                print(f"[alerts] send to {cid} failed: {e!r}")
+                                if "chat not found" in str(e).lower() or "kicked" in str(e).lower() or "forbidden" in str(e).lower():
+                                    _register_alert_chat(cid, False)
                         sent_pub.add(uid)
                         _sp = _prune_seen(list(sent_pub))
                         _update_state_fields(lambda s, _sp=_sp: s["watch"]["sent_public"].__setitem__("buy", _sp))
@@ -2676,8 +2732,19 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Not allowed.")
         return
     arg = (context.args[0].strip().lower() if context.args else "")
+    if arg == "chats":
+        chats = _alert_chat_ids()
+        await update.message.reply_text("Alert groups: " + (", ".join(str(c) for c in chats) if chats else "none") + "\nRemove one: /alerts remove <chat_id>")
+        return
+    if arg == "remove" and len(context.args) == 2:
+        try:
+            _register_alert_chat(int(context.args[1]), False)
+            await update.message.reply_text("Removed.")
+        except Exception:
+            await update.message.reply_text("Invalid chat id.")
+        return
     if arg not in ("on", "off"):
-        await update.message.reply_text("Usage: /alerts on|off")
+        await update.message.reply_text("Usage: /alerts on|off | /alerts chats | /alerts remove <chat_id>")
         return
     _update_state_fields(lambda s: s.__setitem__("alerts_dm", arg == "on"))
     await update.message.reply_text(f"OK. DM alerts {'ON' if arg == 'on' else 'OFF'}.")
@@ -2814,6 +2881,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setmin <usd> – minimum buy to alert\n"
         "/setemoji <usd> – USD per emoji in the bar\n"
         "/alerts on|off – DM alerts to admin\n"
+        "/alerts chats – list groups receiving alerts (auto-registered when the bot is added)\n"
         "/scan <tx_hash> – test detection on a tx\n"
         "/scan <blocks_back> <min_usd> – scan a range"
     )
@@ -2827,8 +2895,9 @@ async def _count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_startup(app):
     if ADMIN_ID > 0:
         try:
-            mode = "group mode" if ALLOWED_CHAT_ID else "test mode (DM only)"
-            await app.bot.send_message(chat_id=ADMIN_ID, text=f"Bot started – buy alerts {mode}. Use /help")
+            chats = _alert_chat_ids()
+            mode = f"posting to {len(chats)} group(s)" if chats else "no group registered yet (DM only) – add the bot to a group or send any message there"
+            await app.bot.send_message(chat_id=ADMIN_ID, text=f"Bot started – buy alerts: {mode}. Use /help")
         except Exception:
             pass
     _ensure_data_dir()
@@ -2855,8 +2924,10 @@ def main():
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(MessageHandler(filters.ALL, _count_message), group=1)
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, _register_from_message), group=2)
 
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
