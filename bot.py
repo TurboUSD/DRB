@@ -101,7 +101,7 @@ WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
 WATCH_LOG_CHUNK = int(os.environ.get("WATCH_LOG_CHUNK", "2000"))
 BUY_RECEIPT_PREFILTER_PCT = float(os.environ.get("BUY_RECEIPT_PREFILTER_PCT", "0.10"))
 DEFAULT_MIN_BUY_USD = float(os.environ.get("DEFAULT_MIN_BUY_USD", "10000"))   # used when no saved state exists
-DEFAULT_EMOJI_USD = float(os.environ.get("DEFAULT_EMOJI_USD", "100"))
+DEFAULT_EMOJI_USD = float(os.environ.get("DEFAULT_EMOJI_USD", "250"))
 
 DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
