@@ -81,6 +81,29 @@ GROK_BG_PATH = "assets/grok_wallet_bg.png"
 CARD_W = 896
 CARD_H = 658
 
+# ---- Buy alerts (ported from the CLAWD bot) ----
+ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))  # group to post buy alerts in (0 = only DM admin)
+USDT_TOKEN = "0xd9aaEC86B65D86f6A7B5B1b0c42FFA531710b6CA"
+BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+CHAINLINK_ETH_USD_FEED = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"  # ETH/USD on Base
+TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+ASSET_BUY = os.environ.get("ASSET_BUY", "assets/DRB.png")
+BUY_EMOJI = os.environ.get("BUY_EMOJI", "💸")
+MAX_EMOJIS = 100
+
+WATCH_POLL_SEC = max(10, int(os.environ.get("WATCH_POLL_SEC", "60")))
+MAX_EVENT_AGE_SEC = int(os.environ.get("MAX_EVENT_AGE_SEC", "1800"))
+WATCH_OVERLAP_BLOCKS = int(os.environ.get("WATCH_OVERLAP_BLOCKS", "8"))
+WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
+WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
+WATCH_LOG_CHUNK = int(os.environ.get("WATCH_LOG_CHUNK", "2000"))
+BUY_RECEIPT_PREFILTER_PCT = float(os.environ.get("BUY_RECEIPT_PREFILTER_PCT", "0.10"))
+
+DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
+
 
 # ================= HELPERS =================
 
@@ -1967,6 +1990,835 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# ================= BUY ALERTS (ported from CLAWD bot) =================
+#
+# Detects DRB buys from tx receipts (net ERC-20 deltas per address), with the same
+# false-positive filters as the CLAWD bot:
+#   - final DRB receiver must be an EOA (not a contract / pool / locker / grok wallet)
+#   - payment path: native ETH (tx.value) > USDC/USDT outflow > WETH outflow
+#   - payer must be tx.from (or an EOA when routed through an aggregator/relayer)
+#   - coherence filter: stable-paid buys must be within [0.10x, 8x] of price*tokens
+#   - ETH valued with Chainlink ETH/USD at the tx block (live fallback for realtime)
+#   - dedup by tx hash (seen + sent lists persisted on disk), max event age filter
+
+# ---- State (persisted JSON) ----
+
+DEFAULT_STATE = {
+    "min_usd": {"buy": 100.0},
+    "emoji_usd": {"buy": 100.0},
+    "alerts_dm": True,
+    "watch": {
+        "last_scanned_block": 0,
+        "seen": {"buy": []},
+        "sent_public": {"buy": []},
+        "sent_dm": {"buy": []},
+    },
+    "cache": {"token_price_usd": None},
+}
+
+
+def _ensure_data_dir() -> None:
+    try:
+        os.makedirs(DATA_PATH, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _load_state() -> dict:
+    _ensure_data_dir()
+    merged = json.loads(json.dumps(DEFAULT_STATE))
+    if not os.path.exists(STATE_PATH):
+        return merged
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            s = json.load(f)
+        if not isinstance(s, dict):
+            return merged
+        for k in ("min_usd", "emoji_usd", "cache"):
+            if isinstance(s.get(k), dict):
+                merged[k].update(s[k])
+        if "alerts_dm" in s:
+            merged["alerts_dm"] = bool(s["alerts_dm"])
+        w = s.get("watch") or {}
+        if isinstance(w, dict):
+            merged["watch"]["last_scanned_block"] = int(w.get("last_scanned_block") or 0)
+            for k in ("seen", "sent_public", "sent_dm"):
+                if isinstance(w.get(k), dict):
+                    merged["watch"][k]["buy"] = list(w[k].get("buy") or [])
+        return merged
+    except Exception:
+        return merged
+
+
+def _save_state(state: dict) -> None:
+    _ensure_data_dir()
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+
+def _update_state_fields(mutator) -> dict:
+    """Load a FRESH state, apply mutator, save. Never save a long-held state object
+    directly: a stale snapshot would clobber a concurrent /setmin."""
+    fresh = _load_state()
+    mutator(fresh)
+    _save_state(fresh)
+    return fresh
+
+
+def _prune_seen(arr: list) -> list:
+    if len(arr) <= WATCH_MAX_SEEN_EVENTS:
+        return arr
+    return arr[-WATCH_MAX_SEEN_EVENTS:]
+
+
+# ---- RPC helpers ----
+
+def _norm(a: str) -> str:
+    return (a or "").lower()
+
+
+def _rpc_batch(calls: list, _min_chunk: int = 10) -> list:
+    """JSON-RPC batch (list of (method, params)); results in the same order.
+    On failure splits into halves down to _min_chunk, then falls back to serial calls."""
+    if not calls:
+        return []
+    payloads = [{"jsonrpc": "2.0", "id": i, "method": m, "params": p} for i, (m, p) in enumerate(calls)]
+    last_err = None
+    for url in [ALCHEMY_RPC_URL, BASE_FALLBACK_RPC_URL]:
+        try:
+            r = requests.post(url, json=payloads, headers=UA_HEADERS, timeout=30)
+            r.raise_for_status()
+            raw = r.json()
+            if not isinstance(raw, list):
+                raise RuntimeError("batch response is not a list")
+            by_id = {it.get("id"): it.get("result") for it in raw if isinstance(it, dict)}
+            return [by_id.get(i) for i in range(len(calls))]
+        except Exception as e:
+            last_err = e
+            continue
+    print(f"[rpc_batch] batch of {len(calls)} failed: {last_err!r}")
+    if len(calls) > max(1, _min_chunk):
+        mid = len(calls) // 2
+        return _rpc_batch(calls[:mid], _min_chunk) + _rpc_batch(calls[mid:], _min_chunk)
+    out = []
+    for m, p in calls:
+        try:
+            out.append(_rpc_call(m, p))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _get_latest_block() -> int:
+    return int(_rpc_call("eth_blockNumber", []), 16)
+
+
+def _get_receipt(tx_hash: str):
+    return _rpc_call("eth_getTransactionReceipt", [tx_hash])
+
+
+def _get_tx(tx_hash: str):
+    return _rpc_call("eth_getTransactionByHash", [tx_hash])
+
+
+_IS_CONTRACT_CACHE = {}
+
+
+def _is_contract(addr: str, block_number=None) -> bool:
+    key = _norm(addr)
+    if key in _IS_CONTRACT_CACHE:
+        return _IS_CONTRACT_CACHE[key]
+    try:
+        tag = hex(int(block_number)) if block_number is not None else "latest"
+        code = _rpc_call("eth_getCode", [addr, tag])
+        result = isinstance(code, str) and code not in ("0x", "0x0", "")
+        _IS_CONTRACT_CACHE[key] = result
+        return result
+    except Exception:
+        return False  # if in doubt, do not classify as contract
+
+
+def _get_token_logs_chunked(token: str, from_block: int, to_block: int) -> list:
+    """All Transfer logs of `token` in [from_block, to_block], chunked eth_getLogs."""
+    logs = []
+    cur = from_block
+    while cur <= to_block:
+        end = min(to_block, cur + max(1, WATCH_LOG_CHUNK) - 1)
+        chunk = _rpc_call("eth_getLogs", [{
+            "fromBlock": hex(cur),
+            "toBlock": hex(end),
+            "address": token,
+            "topics": [TRANSFER_TOPIC0],
+        }])
+        logs.extend(chunk or [])
+        cur = end + 1
+    return logs
+
+
+_BLOCK_TS_CACHE = {}
+
+
+def _get_block_timestamp(block_number: int):
+    if block_number in _BLOCK_TS_CACHE:
+        return _BLOCK_TS_CACHE[block_number]
+    try:
+        blk = _rpc_call("eth_getBlockByNumber", [hex(block_number), False])
+        ts = int(blk.get("timestamp"), 16)
+        _BLOCK_TS_CACHE[block_number] = ts
+        if len(_BLOCK_TS_CACHE) > 2000:
+            for k in sorted(_BLOCK_TS_CACHE)[:500]:
+                _BLOCK_TS_CACHE.pop(k, None)
+        return ts
+    except Exception:
+        return None
+
+
+def _event_is_too_old(block_number) -> bool:
+    if MAX_EVENT_AGE_SEC <= 0 or block_number is None:
+        return False
+    ts = _get_block_timestamp(int(block_number))
+    if not ts:
+        return False
+    return (int(time.time()) - int(ts)) > MAX_EVENT_AGE_SEC
+
+
+# ---- ETH/USD pricing (Chainlink at block, live fallback) ----
+
+_CL_DECIMALS = None
+_CL_BLOCK_BUCKET = 30
+_CL_PRICE_CACHE = {}
+
+
+def _chainlink_eth_usd_at_block(block_number: int):
+    global _CL_DECIMALS
+    try:
+        bucket = int(block_number) // _CL_BLOCK_BUCKET
+        if bucket in _CL_PRICE_CACHE:
+            return _CL_PRICE_CACHE[bucket]
+        tag = hex(int(block_number))
+        if _CL_DECIMALS is None:
+            _CL_DECIMALS = int(_rpc_call("eth_call", [{"to": CHAINLINK_ETH_USD_FEED, "data": "0x313ce567"}, tag]), 16)
+        data = _rpc_call("eth_call", [{"to": CHAINLINK_ETH_USD_FEED, "data": "0xfeaf968c"}, tag])  # latestRoundData()
+        raw = data[2:] if isinstance(data, str) and data.startswith("0x") else ""
+        if len(raw) < 64 * 5:
+            return None
+        answer = _int256(raw[64:128])
+        if answer <= 0:
+            return None
+        price = answer / 10 ** _CL_DECIMALS
+        _CL_PRICE_CACHE[bucket] = price
+        if len(_CL_PRICE_CACHE) > 5000:
+            _CL_PRICE_CACHE.clear()
+        return price
+    except Exception:
+        return None
+
+
+def _eth_usd_price(block_number=None, allow_live_fallback: bool = True):
+    """1) Chainlink ETH/USD at the tx block. 2) Chainlink latest. 3) DexScreener WETH (live only)."""
+    if block_number is not None:
+        px = _chainlink_eth_usd_at_block(int(block_number))
+        if px and px > 0:
+            return float(px)
+        if not allow_live_fallback:
+            return None
+    try:
+        latest = _get_latest_block()
+        px = _chainlink_eth_usd_at_block(latest)
+        if px and px > 0:
+            return float(px)
+    except Exception:
+        pass
+    if allow_live_fallback:
+        try:
+            return float(fetch_price_usd(WETH_TOKEN))
+        except Exception:
+            pass
+    return None
+
+
+def _drb_price_cached():
+    """DRB price from DexScreener with persisted fallback in state cache."""
+    try:
+        price = float(fetch_price_usd(DRB_TOKEN))
+        _update_state_fields(lambda s: s["cache"].__setitem__("token_price_usd", price))
+        return price
+    except Exception:
+        p = (_load_state().get("cache") or {}).get("token_price_usd")
+        return float(p) if p else 0.0
+
+
+# ---- Receipt analysis ----
+
+def _aggregate_net_deltas_from_receipt(receipt: dict, tokens: list) -> dict:
+    deltas = {_norm(t): {} for t in tokens}
+    for lg in receipt.get("logs", []) or []:
+        addr = _norm(lg.get("address", ""))
+        if addr not in deltas:
+            continue
+        topics = lg.get("topics") or []
+        if len(topics) < 3 or _norm(topics[0]) != TRANSFER_TOPIC0:
+            continue
+        frm = _topic_addr(topics[1])
+        to = _topic_addr(topics[2])
+        try:
+            v = int(lg.get("data", "0x0"), 16)
+        except Exception:
+            continue
+        d = deltas[addr]
+        d[frm] = d.get(frm, 0) - v
+        d[to] = d.get(to, 0) + v
+    return deltas
+
+
+def _pick_final_buyer(token_deltas: dict, exclude: set):
+    best_addr, best_delta = None, 0
+    for addr, delta in token_deltas.items():
+        if addr in exclude:
+            continue
+        if delta > best_delta:
+            best_delta, best_addr = delta, addr
+    return best_addr
+
+
+def _pick_final_seller(token_deltas: dict, exclude: set):
+    best_addr, best_out = None, 0
+    for addr, delta in token_deltas.items():
+        if addr in exclude:
+            continue
+        if delta < 0 and -delta > best_out:
+            best_out, best_addr = -delta, addr
+    return best_addr
+
+
+def _max_outflow_addr(d: dict):
+    best_addr, best_out = None, 0
+    for addr, v in (d or {}).items():
+        if v < 0 and -v > best_out:
+            best_out, best_addr = -v, addr
+    return best_addr, best_out
+
+
+def _max_inflow_addr(d: dict):
+    best_addr, best_in = None, 0
+    for addr, v in (d or {}).items():
+        if v > 0 and v > best_in:
+            best_in, best_addr = v, addr
+    return best_addr, best_in
+
+
+def _buy_exclude_set() -> set:
+    ex = {DRB_TOKEN, WETH_TOKEN, USDC_TOKEN, USDT_TOKEN, BURN_ADDRESS, ZERO_ADDRESS,
+          GROK_WALLET, CLAIM_CONTRACT, CLAIM_RECIPIENT}
+    try:
+        pool = _get_main_pool()
+        if pool:
+            ex.add(pool["pair"])
+    except Exception:
+        pass
+    return {_norm(a) for a in ex}
+
+
+def _receipt_block_number(receipt: dict):
+    try:
+        bn = receipt.get("blockNumber")
+        return int(bn, 16) if isinstance(bn, str) and bn.startswith("0x") else None
+    except Exception:
+        return None
+
+
+def _payer_ok(payer: str, tx_from: str, block_number) -> bool:
+    """Anti false-positive rule from CLAWD:
+    - tx.from is an EOA: payer must be tx.from, or at least another EOA (aggregator path).
+    - tx.from is a contract (relayer/router): payer must be an EOA."""
+    if not tx_from:
+        return True
+    if not _is_contract(tx_from, block_number):
+        if _norm(payer) != _norm(tx_from) and _is_contract(payer, block_number):
+            return False
+    else:
+        if _is_contract(payer, block_number):
+            return False
+    return True
+
+
+def _buy_from_receipt(tx_hash: str, receipt: dict, allow_live_eth_fallback: bool = False):
+    """Return {buyer, usd, tokens, eth, pay:{eth,usdc,usdt,weth}} or None."""
+    if not receipt or str(receipt.get("status", "0x1")).lower() not in ("0x1", "1"):
+        return None
+    block_number = _receipt_block_number(receipt)
+
+    deltas = _aggregate_net_deltas_from_receipt(receipt, [DRB_TOKEN, USDC_TOKEN, USDT_TOKEN, WETH_TOKEN])
+    tdel = deltas.get(_norm(DRB_TOKEN)) or {}
+    if not tdel:
+        return None
+
+    exclude = _buy_exclude_set()
+    buyer = _pick_final_buyer(tdel, exclude)
+    if not buyer:
+        return None
+    # Final receiver must be a person (EOA), not a contract
+    if _is_contract(buyer, block_number):
+        return None
+
+    tokens_delta = int(tdel.get(buyer, 0))
+    if tokens_delta <= 0:
+        return None
+    tokens_bought = tokens_delta / 10 ** erc20_decimals(DRB_TOKEN)
+
+    price = _drb_price_cached()
+    usd_est = price * tokens_bought
+
+    usdc_del = deltas.get(_norm(USDC_TOKEN)) or {}
+    usdt_del = deltas.get(_norm(USDT_TOKEN)) or {}
+    weth_del = deltas.get(_norm(WETH_TOKEN)) or {}
+    payer_usdc, usdc_out = _max_outflow_addr(usdc_del)
+    payer_usdt, usdt_out = _max_outflow_addr(usdt_del)
+    payer_weth, weth_out = _max_outflow_addr(weth_del)
+
+    spent_usd = 0.0
+    eth_spent = usdc_spent = usdt_spent = weth_spent = 0.0
+
+    tx_from, eth_value = "", 0
+    try:
+        tx = _get_tx(tx_hash)
+        tx_from = _norm(tx.get("from", ""))
+        eth_value = int(tx.get("value", "0x0"), 16)
+    except Exception:
+        pass
+
+    paid_with_eth = eth_value > 0
+    if paid_with_eth:
+        # Native ETH buy: value ONLY the ETH, ignore stable movements inside the tx
+        eth_spent = eth_value / 10 ** 18
+        wp = _eth_usd_price(block_number, allow_live_eth_fallback)
+        if not wp:
+            return None
+        spent_usd = eth_spent * wp
+    else:
+        if usdc_out > 0 or usdt_out > 0:
+            payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
+            if payer:
+                if not _payer_ok(payer, tx_from, block_number):
+                    return None
+                usdc_spent = max(0, -usdc_del.get(payer, 0)) / 10 ** 6
+                usdt_spent = max(0, -usdt_del.get(payer, 0)) / 10 ** 6
+                spent_usd = usdc_spent + usdt_spent
+
+        if spent_usd <= 0 and weth_out > 0 and payer_weth:
+            if not _payer_ok(payer_weth, tx_from, block_number):
+                return None
+            wp = _eth_usd_price(block_number, allow_live_eth_fallback)
+            if not wp:
+                return None
+            weth_spent = max(0, -weth_del.get(payer_weth, 0)) / 10 ** 18
+            spent_usd = weth_spent * wp
+            eth_spent = weth_spent
+
+        if spent_usd <= 0:
+            return None
+
+    paid_with_weth = weth_spent > 0
+    # Coherence filter (stable-paid buys only; ETH/WETH price estimates can drift)
+    if not paid_with_eth and not paid_with_weth and usd_est > 0:
+        if spent_usd < usd_est * 0.10 or spent_usd > usd_est * 8.0:
+            return None
+
+    return {
+        "buyer": buyer,
+        "usd": float(spent_usd),
+        "tokens": float(tokens_bought),
+        "eth": float(eth_spent),
+        "pay": {"eth": float(eth_spent), "usdc": float(usdc_spent), "usdt": float(usdt_spent), "weth": float(weth_spent)},
+    }
+
+
+def _sell_from_receipt(tx_hash: str, receipt: dict):
+    """Used only to mark sells as seen (so they are not re-processed). Returns dict or None."""
+    if not receipt:
+        return None
+    block_number = _receipt_block_number(receipt)
+    deltas = _aggregate_net_deltas_from_receipt(receipt, [DRB_TOKEN, USDC_TOKEN, USDT_TOKEN, WETH_TOKEN])
+    tdel = deltas.get(_norm(DRB_TOKEN)) or {}
+    if not tdel:
+        return None
+    seller = _pick_final_seller(tdel, _buy_exclude_set())
+    if not seller:
+        return None
+    tokens_sold = -int(tdel.get(seller, 0)) / 10 ** erc20_decimals(DRB_TOKEN)
+    if tokens_sold <= 0:
+        return None
+    usd_est = _drb_price_cached() * tokens_sold
+
+    usdc_del = deltas.get(_norm(USDC_TOKEN)) or {}
+    usdt_del = deltas.get(_norm(USDT_TOKEN)) or {}
+    weth_del = deltas.get(_norm(WETH_TOKEN)) or {}
+    r_usdc, usdc_in = _max_inflow_addr(usdc_del)
+    r_usdt, usdt_in = _max_inflow_addr(usdt_del)
+    r_weth, weth_in = _max_inflow_addr(weth_del)
+
+    got_usd = 0.0
+    if usdc_in > 0 or usdt_in > 0:
+        recv = r_usdc if usdc_in >= usdt_in else r_usdt
+        if recv:
+            got_usd += max(0, usdc_del.get(recv, 0)) / 10 ** 6
+            got_usd += max(0, usdt_del.get(recv, 0)) / 10 ** 6
+    if got_usd <= 0 and weth_in > 0 and r_weth:
+        wp = _eth_usd_price(block_number, allow_live_fallback=False) or 0.0
+        got_usd += max(0, weth_del.get(r_weth, 0)) / 10 ** 18 * wp
+    if got_usd <= 0:
+        return None
+    if usd_est > 0 and (got_usd < usd_est * 0.20 or got_usd > usd_est * 5.0):
+        return None
+    return {"seller": seller, "usd": float(got_usd), "tokens": float(tokens_sold)}
+
+
+# ---- Alert formatting / sending ----
+
+def _emoji_bar(total_usd: float, usd_per_emoji: float) -> str:
+    if usd_per_emoji <= 0:
+        usd_per_emoji = 100.0
+    n = int(total_usd / usd_per_emoji)
+    return BUY_EMOJI * max(1, min(n, MAX_EMOJIS))
+
+
+def _payment_line(pay: dict) -> str:
+    if not pay:
+        return ""
+    lines = []
+    if pay.get("eth", 0) > 0:
+        lines.append(f"ETH: {_fmt_sig(pay['eth'])}")
+    if pay.get("usdc", 0) > 0:
+        lines.append(f"USDC: {int(round(pay['usdc'])):,}")
+    if pay.get("usdt", 0) > 0:
+        lines.append(f"USDT: {int(round(pay['usdt'])):,}")
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def _buy_caption(tx_hash: str, tokens: float, usd: float, buyer: str, pay: dict = None) -> str:
+    state = _load_state()
+    bar = _emoji_bar(usd, float(state["emoji_usd"]["buy"]))
+    tx_url = f"https://basescan.org/tx/{tx_hash}"
+    wallet_url = f"https://basescan.org/address/{buyer}"
+    return (
+        "<b>DRB BOUGHT!</b>\n\n"
+        f"{bar}\n\n"
+        f'DRB: {_fmt_big(tokens)} ({_fmt_int_usd(usd)}) (<a href="{tx_url}">Tx</a>)\n'
+        + _payment_line(pay)
+        + f'Wallet: <a href="{wallet_url}">{_short_addr_dots(buyer)}</a>'
+    )
+
+
+async def _send_buy_alert(app, chat_id: int, caption: str) -> None:
+    if ASSET_BUY and os.path.exists(ASSET_BUY):
+        with open(ASSET_BUY, "rb") as f:
+            await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
+    else:
+        await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+
+
+# ---- Monitor loop ----
+
+def _monitor_tick_sync() -> list:
+    """Scan new blocks for DRB buys. Returns [(buy_id, caption), ...] above min_usd."""
+    state = _load_state()
+    latest = _get_latest_block()
+    end = max(0, latest - max(0, WATCH_CONFIRMATIONS))
+    last_scanned = int(state["watch"].get("last_scanned_block") or 0)
+    start = max(0, end - 5) if last_scanned <= 0 else max(0, last_scanned - WATCH_OVERLAP_BLOCKS)
+    if end < start:
+        return []
+
+    logs = _get_token_logs_chunked(DRB_TOKEN, start, end)
+    seen_buy = set(state["watch"]["seen"].get("buy") or [])
+    min_buy = float(state["min_usd"]["buy"])
+    token_price = _drb_price_cached()
+    drb_dec = erc20_decimals(DRB_TOKEN)
+
+    # Prefilter: estimate DRB moved per tx so tiny txs never need a receipt fetch
+    txs, tx_value_est = [], {}
+    for lg in logs:
+        h = lg.get("transactionHash")
+        if not h:
+            continue
+        try:
+            topics = lg.get("topics") or []
+            if len(topics) >= 3 and _norm(topics[0]) == TRANSFER_TOPIC0:
+                tx_value_est[h] = tx_value_est.get(h, 0.0) + int(lg.get("data", "0x0"), 16) / 10 ** drb_dec
+        except Exception:
+            pass
+        if h not in txs:
+            txs.append(h)
+
+    need = []
+    for h in txs:
+        if f"buy:{h}" in seen_buy:
+            continue
+        if token_price > 0 and tx_value_est.get(h, 0.0) * token_price < min_buy * BUY_RECEIPT_PREFILTER_PCT:
+            continue
+        need.append(h)
+
+    receipts = {}
+    for i in range(0, len(need), 75):
+        chunk = need[i:i + 75]
+        try:
+            res = _rpc_batch([("eth_getTransactionReceipt", [h]) for h in chunk])
+        except Exception:
+            res = [None] * len(chunk)
+        receipts.update(dict(zip(chunk, res)))
+
+    outgoing = []
+    for h in need:
+        buy_id = f"buy:{h}"
+        try:
+            receipt = receipts.get(h)
+            if receipt is None:
+                continue  # retry next tick within the overlap window
+            buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
+            if buy:
+                if buy["usd"] >= min_buy and not _event_is_too_old(_receipt_block_number(receipt)):
+                    outgoing.append((buy_id, _buy_caption(h, buy["tokens"], buy["usd"], buy["buyer"], buy.get("pay"))))
+                seen_buy.add(buy_id)
+                continue
+            # Sell -> mark as seen so it is not re-processed. Anything else: leave unseen for retry.
+            try:
+                if _sell_from_receipt(h, receipt):
+                    seen_buy.add(buy_id)
+            except Exception:
+                pass
+        except Exception as e:
+            print("buy tick error:", h, repr(e))
+
+    def _persist(s):
+        s["watch"]["last_scanned_block"] = end
+        s["watch"]["seen"]["buy"] = _prune_seen(list(seen_buy))
+    _update_state_fields(_persist)
+    return outgoing
+
+
+async def buy_monitor(app) -> None:
+    while True:
+        try:
+            outgoing = await asyncio.to_thread(_monitor_tick_sync)
+            if outgoing:
+                state = _load_state()
+                sent_pub = set(state["watch"]["sent_public"].get("buy") or [])
+                sent_dm = set(state["watch"]["sent_dm"].get("buy") or [])
+                dm_enabled = bool(state.get("alerts_dm", True)) and ADMIN_ID > 0
+
+                for uid, caption in outgoing:
+                    if ALLOWED_CHAT_ID and uid not in sent_pub:
+                        await _send_buy_alert(app, ALLOWED_CHAT_ID, caption)
+                        sent_pub.add(uid)
+                        _sp = _prune_seen(list(sent_pub))
+                        _update_state_fields(lambda s, _sp=_sp: s["watch"]["sent_public"].__setitem__("buy", _sp))
+                    if dm_enabled and uid not in sent_dm:
+                        sent_dm.add(uid)
+                        _sd = _prune_seen(list(sent_dm))
+                        _update_state_fields(lambda s, _sd=_sd: s["watch"]["sent_dm"].__setitem__("buy", _sd))
+                        await _send_buy_alert(app, ADMIN_ID, caption)
+        except Exception as e:
+            print("buy_monitor error:", repr(e))
+        await asyncio.sleep(WATCH_POLL_SEC)
+
+
+# ---- Commands: /setmin /setemoji /alerts /scan ----
+
+def _is_admin_user(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u) and ADMIN_ID > 0 and u.id == ADMIN_ID
+
+
+async def setmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if not _is_admin_user(update):
+        await update.message.reply_text("Not allowed.")
+        return
+    args = [a for a in (context.args or []) if a.lower() != "buy"]
+    if len(args) != 1:
+        await update.message.reply_text("Usage: /setmin <usd>")
+        return
+    try:
+        usd = max(0.0, float(args[0]))
+    except Exception:
+        await update.message.reply_text("Invalid usd.")
+        return
+    _update_state_fields(lambda s: s["min_usd"].__setitem__("buy", usd))
+    await update.message.reply_text(f"OK. Minimum buy alert = ${usd:,.0f}")
+
+
+async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if not _is_admin_user(update):
+        await update.message.reply_text("Not allowed.")
+        return
+    args = [a for a in (context.args or []) if a.lower() != "buy"]
+    if len(args) != 1:
+        await update.message.reply_text("Usage: /setemoji <usd_per_emoji>")
+        return
+    try:
+        usd_per = max(0.01, float(args[0]))
+    except Exception:
+        await update.message.reply_text("Invalid usd_per_emoji.")
+        return
+    _update_state_fields(lambda s: s["emoji_usd"].__setitem__("buy", usd_per))
+    await update.message.reply_text(f"OK. 1 {BUY_EMOJI} = ${usd_per:,.2f} (max {MAX_EMOJIS})")
+
+
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if not _is_admin_user(update):
+        await update.message.reply_text("Not allowed.")
+        return
+    arg = (context.args[0].strip().lower() if context.args else "")
+    if arg not in ("on", "off"):
+        await update.message.reply_text("Usage: /alerts on|off")
+        return
+    _update_state_fields(lambda s: s.__setitem__("alerts_dm", arg == "on"))
+    await update.message.reply_text(f"OK. DM alerts {'ON' if arg == 'on' else 'OFF'}.")
+
+
+async def _scan_range_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> None:
+    loop = asyncio.get_running_loop()
+
+    def _dm(text: str):
+        fut = asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=user_id, text=text, disable_web_page_preview=True), loop)
+        try:
+            fut.result(timeout=15)
+        except Exception:
+            pass
+
+    def _run():
+        t0 = time.time()
+        end = max(0, _get_latest_block() - max(0, WATCH_CONFIRMATIONS))
+        start = max(0, end - blocks_back + 1)
+        _dm(f"Scan started. Range {start} → {end}, min ${min_usd:,.0f}. Fetching logs...")
+        logs = _get_token_logs_chunked(DRB_TOKEN, start, end)
+        hashes = list(dict.fromkeys(lg.get("transactionHash") for lg in logs if lg.get("transactionHash")))
+        _dm(f"Logs: {len(logs):,} · unique txs: {len(hashes):,}. Fetching receipts...")
+
+        matches, ok, fail = [], 0, 0
+        for i in range(0, len(hashes), 75):
+            chunk = hashes[i:i + 75]
+            try:
+                res = _rpc_batch([("eth_getTransactionReceipt", [h]) for h in chunk])
+            except Exception:
+                res = [None] * len(chunk)
+            for h, r in zip(chunk, res):
+                try:
+                    if r is None:
+                        raise RuntimeError("no receipt")
+                    ok += 1
+                    b = _buy_from_receipt(h, r, allow_live_eth_fallback=True)
+                    if b and b["usd"] >= min_usd:
+                        matches.append((h, b))
+                except Exception:
+                    fail += 1
+            if (i // 75) % 4 == 3:
+                _dm(f"Progress: {min(i + 75, len(hashes)):,}/{len(hashes):,} matches={len(matches)} ({time.time() - t0:.0f}s)")
+
+        matches.sort(key=lambda x: x[1]["usd"], reverse=True)
+        lines = [
+            "Scan finished",
+            f"Blocks: {blocks_back} ({start} → {end})",
+            f"Unique txs: {len(hashes):,} · receipts ok={ok:,} fail={fail:,}",
+            f"Matches (>= ${min_usd:,.0f}): {len(matches):,}",
+            f"Time: {time.time() - t0:.1f}s",
+        ]
+        if matches:
+            usd_per = float(_load_state()["emoji_usd"]["buy"])
+            lines += ["", "Top results (max 20):"]
+            for h, b in matches[:20]:
+                lines += ["", f"{_emoji_bar(b['usd'], usd_per)} ${b['usd']:,.2f}",
+                          f"Buyer: {b['buyer']}",
+                          f"Tokens: {_fmt_big(b['tokens'])} DRB",
+                          f"Tx: https://basescan.org/tx/{h}"]
+        _dm("\n".join(lines))
+
+    await asyncio.to_thread(_run)
+
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scan <tx_hash>  -> test detection on one tx (sends the alert in DM)
+       /scan <blocks_back> <min_usd> -> scan a range, results in DM"""
+    msg = update.message
+    if not msg or not update.effective_user:
+        return
+    if not _is_admin_user(update):
+        await msg.reply_text("Not allowed.")
+        return
+    user_id = update.effective_user.id
+    args = context.args or []
+
+    if len(args) == 1:
+        tx_hash = args[0].strip()
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
+            await msg.reply_text("Usage: /scan <tx_hash>  OR  /scan <blocks_back> <min_usd>")
+            return
+        await msg.reply_text("Scanning tx...")
+        try:
+            receipt = await asyncio.to_thread(_get_receipt, tx_hash)
+        except Exception:
+            receipt = None
+        if not receipt:
+            await msg.reply_text("Transaction not found (no receipt).")
+            return
+        buy = None
+        try:
+            buy = await asyncio.to_thread(_buy_from_receipt, tx_hash, receipt, True)
+        except Exception as e:
+            print("scan tx error:", repr(e))
+        if buy:
+            caption = _buy_caption(tx_hash, buy["tokens"], buy["usd"], buy["buyer"], buy.get("pay"))
+            await _send_buy_alert(context.application, user_id, caption)
+            await msg.reply_text(f"Buy detected (${buy['usd']:,.2f}). Alert sent in DM.")
+            return
+        sell = None
+        try:
+            sell = await asyncio.to_thread(_sell_from_receipt, tx_hash, receipt)
+        except Exception:
+            pass
+        await msg.reply_text("That tx looks like a SELL." if sell else "That tx is not detected as a DRB buy.")
+        return
+
+    if len(args) != 2:
+        await msg.reply_text("Usage: /scan <blocks_back> <min_usd>  OR  /scan <tx_hash>")
+        return
+    try:
+        blocks_back = max(1, min(20000, int(args[0])))
+        min_usd = float(args[1])
+    except Exception:
+        await msg.reply_text("Invalid args. Example: /scan 5000 500")
+        return
+    await msg.reply_text(f"Scanning last {blocks_back} blocks for buys >= ${min_usd:,.0f}. Check your DM.")
+    asyncio.create_task(_scan_range_and_dm(context.application, user_id, blocks_back, min_usd))
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "Commands\n\n"
+        "/grok – Grok wallet balances\n"
+        "/grok2 – Grok wallet card\n"
+        "/stats [7d|4w] – claim stats\n"
+        "/buys [7d] – biggest buys\n"
+        "/claim – claim trading fees (admins)\n\n"
+        "Buy alerts (admin only)\n"
+        "/setmin <usd> – minimum buy to alert\n"
+        "/setemoji <usd> – USD per emoji in the bar\n"
+        "/alerts on|off – DM alerts to admin\n"
+        "/scan <tx_hash> – test detection on a tx\n"
+        "/scan <blocks_back> <min_usd> – scan a range"
+    )
+
+
 async def _count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Increment per-chat message counter for non-admin warning cooldown."""
     context.chat_data["msg_count"] = context.chat_data.get("msg_count", 0) + 1
@@ -1975,9 +2827,12 @@ async def _count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_startup(app):
     if ADMIN_ID > 0:
         try:
-            await app.bot.send_message(chat_id=ADMIN_ID, text="Bot started")
+            mode = "group mode" if ALLOWED_CHAT_ID else "test mode (DM only)"
+            await app.bot.send_message(chat_id=ADMIN_ID, text=f"Bot started – buy alerts {mode}. Use /help")
         except Exception:
             pass
+    _ensure_data_dir()
+    asyncio.create_task(buy_monitor(app))
 
 
 def main():
@@ -1994,6 +2849,11 @@ def main():
     app.add_handler(CommandHandler("buys", buys_command))
     app.add_handler(CommandHandler("claim", claim_command))
     app.add_handler(CallbackQueryHandler(claim_callback, pattern="^claim_"))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("setmin", setmin_command))
+    app.add_handler(CommandHandler("setemoji", setemoji_command))
+    app.add_handler(CommandHandler("alerts", alerts_command))
+    app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(MessageHandler(filters.ALL, _count_message), group=1)
 
     app.run_polling()
