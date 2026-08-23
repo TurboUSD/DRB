@@ -2334,10 +2334,13 @@ def _receipt_block_number(receipt: dict):
         return None
 
 
-def _payer_ok(payer: str, tx_from: str, block_number) -> bool:
+def _payer_ok(payer: str, tx_from: str, block_number, buyer: str = "") -> bool:
     """Anti false-positive rule from CLAWD:
+    - the buyer itself paying is always fine (smart wallet paying with its own funds)
     - tx.from is an EOA: payer must be tx.from, or at least another EOA (aggregator path).
     - tx.from is a contract (relayer/router): payer must be an EOA."""
+    if buyer and _norm(payer) == _norm(buyer):
+        return True
     if not tx_from:
         return True
     if not _is_contract(tx_from, block_number):
@@ -2365,18 +2368,20 @@ def _buy_from_receipt(tx_hash: str, receipt: dict, allow_live_eth_fallback: bool
     if not buyer:
         return None
 
-    tx_from, eth_value = "", 0
+    tx_from, tx_to, eth_value = "", "", 0
     try:
         tx = _get_tx(tx_hash)
         tx_from = _norm(tx.get("from", ""))
+        tx_to = _norm(tx.get("to", "") or "")
         eth_value = int(tx.get("value", "0x0"), 16)
     except Exception:
         pass
 
     # Final receiver must be a person: an EOA, or a smart-contract wallet (Safe / AA /
-    # Coinbase Smart Wallet...) that is itself the sender of the tx. Any other contract
-    # (pool, router, locker) is not a personal buy.
-    if _is_contract(buyer, block_number) and _norm(buyer) != tx_from:
+    # Coinbase Smart Wallet...) that is the sender OR the direct target of the tx
+    # (owner EOA executing their own smart wallet). Any other contract (pool, router,
+    # locker) is not a personal buy.
+    if _is_contract(buyer, block_number) and _norm(buyer) not in (tx_from, tx_to):
         return None
 
     tokens_delta = int(tdel.get(buyer, 0))
@@ -2409,14 +2414,14 @@ def _buy_from_receipt(tx_hash: str, receipt: dict, allow_live_eth_fallback: bool
         if usdc_out > 0 or usdt_out > 0:
             payer = payer_usdc if usdc_out >= usdt_out else payer_usdt
             if payer:
-                if not _payer_ok(payer, tx_from, block_number):
+                if not _payer_ok(payer, tx_from, block_number, buyer):
                     return None
                 usdc_spent = max(0, -usdc_del.get(payer, 0)) / 10 ** 6
                 usdt_spent = max(0, -usdt_del.get(payer, 0)) / 10 ** 6
                 spent_usd = usdc_spent + usdt_spent
 
         if spent_usd <= 0 and weth_out > 0 and payer_weth:
-            if not _payer_ok(payer_weth, tx_from, block_number):
+            if not _payer_ok(payer_weth, tx_from, block_number, buyer):
                 return None
             wp = _eth_usd_price(block_number, allow_live_eth_fallback)
             if not wp:
@@ -2457,12 +2462,14 @@ def _sell_from_receipt(tx_hash: str, receipt: dict):
         return None
     # The seller must be a person (EOA) or the smart wallet sending the tx. Pools,
     # routers and PoolManagers moving DRB internally are not sellers.
-    tx_from = ""
+    tx_from, tx_to = "", ""
     try:
-        tx_from = _norm((_get_tx(tx_hash) or {}).get("from", ""))
+        _tx = _get_tx(tx_hash) or {}
+        tx_from = _norm(_tx.get("from", ""))
+        tx_to = _norm(_tx.get("to", "") or "")
     except Exception:
         pass
-    if _is_contract(seller, block_number) and _norm(seller) != tx_from:
+    if _is_contract(seller, block_number) and _norm(seller) not in (tx_from, tx_to):
         return None
     tokens_sold = -int(tdel.get(seller, 0)) / 10 ** erc20_decimals(DRB_TOKEN)
     if tokens_sold <= 0:
