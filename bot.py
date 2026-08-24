@@ -169,15 +169,53 @@ _PRICE_CACHE = {}
 _PRICE_CACHE_TTL = 300
 
 
+def _dexscreener_get(token: str):
+    """GET DexScreener with retries (2 attempts, short backoff)."""
+    last = None
+    for attempt in range(2):
+        try:
+            r = requests.get(DEXSCREENER_TOKEN_URL + token, headers=UA_HEADERS, timeout=15)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(1.0 * (attempt + 1))
+    raise last
+
+
+def _geckoterminal_price_fdv(token: str):
+    """Fallback price source: GeckoTerminal (no API key). Returns (price, fdv) or (None, None)."""
+    try:
+        r = requests.get(
+            f"https://api.geckoterminal.com/api/v2/networks/base/tokens/{token.lower()}",
+            headers={"accept": "application/json", **UA_HEADERS}, timeout=15)
+        r.raise_for_status()
+        attrs = ((r.json().get("data") or {}).get("attributes") or {})
+        price = float(attrs.get("price_usd") or 0) or None
+        fdv = float(attrs.get("fdv_usd") or 0) or None
+        return price, fdv
+    except Exception:
+        return None, None
+
+
 def fetch_price_usd(token: str) -> float:
     now = time.time()
     c = _PRICE_CACHE.get(token.lower())
     if c and (now - c["ts"]) < _PRICE_CACHE_TTL:
         return c["price"]
 
-    r = requests.get(DEXSCREENER_TOKEN_URL + token, headers=UA_HEADERS, timeout=20)
-    r.raise_for_status()
-    pairs = r.json().get("pairs") or []
+    try:
+        j = _dexscreener_get(token)
+    except Exception:
+        # DexScreener down/slow: try GeckoTerminal, then last known price (stale)
+        gp, _ = _geckoterminal_price_fdv(token)
+        if gp:
+            _PRICE_CACHE[token.lower()] = {"ts": now, "price": gp}
+            return gp
+        if c:
+            return c["price"]
+        raise
+    pairs = j.get("pairs") or []
 
     best_price = None
     best_liq = -1.0
@@ -237,10 +275,12 @@ def _fmt_big(n: float) -> str:
 
 
 def fetch_price_and_fdv(token_addr: str):
-    """Fetch price and FDV (market cap) from DexScreener."""
-    r = requests.get(DEXSCREENER_TOKEN_URL + token_addr, headers=UA_HEADERS, timeout=20)
-    r.raise_for_status()
-    pairs = r.json().get("pairs") or []
+    """Fetch price and FDV (market cap) from DexScreener (with retry; (None, None) on failure)."""
+    try:
+        j = _dexscreener_get(token_addr)
+    except Exception:
+        return _geckoterminal_price_fdv(token_addr)
+    pairs = j.get("pairs") or []
 
     best_price = None
     best_fdv = None
@@ -636,6 +676,10 @@ def make_balance_table_caption(
     else:
         price, fdv = fetch_price_and_fdv(DRB_TOKEN)
         holders = basescan_token_holder_count(DRB_TOKEN)
+        if price is None and cached:
+            # DexScreener hiccup: keep serving the previous stats instead of N/A
+            price, fdv = cached["price"], cached["fdv"]
+            holders = holders if holders is not None else cached["holders"]
         _GROK_STATS_CACHE["ts"] = now
         _GROK_STATS_CACHE["data"] = {"price": price, "fdv": fdv, "holders": holders}
 
@@ -1636,6 +1680,31 @@ async def buys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 CLAIM_COOLDOWN_SECONDS = 8 * 3600  # 8 hours between claims
 _last_claim_ts = 0.0
 _last_claim_tx = None
+_last_claim_amounts = None  # {"weth": float, "drb": float}
+
+
+def _load_last_claim() -> None:
+    """Restore last claim info (ts/tx/amounts) from the state file on startup."""
+    global _last_claim_ts, _last_claim_tx, _last_claim_amounts
+    try:
+        lc = (_load_state().get("cache") or {}).get("last_claim") or {}
+        if lc.get("ts"):
+            _last_claim_ts = float(lc["ts"])
+            _last_claim_tx = lc.get("tx")
+            if lc.get("weth") is not None:
+                _last_claim_amounts = {"weth": float(lc.get("weth") or 0.0), "drb": float(lc.get("drb") or 0.0)}
+    except Exception:
+        pass
+
+
+def _save_last_claim() -> None:
+    try:
+        lc = {"ts": _last_claim_ts, "tx": _last_claim_tx,
+              "weth": (_last_claim_amounts or {}).get("weth"),
+              "drb": (_last_claim_amounts or {}).get("drb")}
+        _update_state_fields(lambda st: st["cache"].__setitem__("last_claim", lc))
+    except Exception:
+        pass
 
 # Track per-user "not admin" warnings to avoid spam: {user_id: (last_warn_ts, msg_count_since)}
 _non_admin_warn: dict = {}
@@ -1897,11 +1966,17 @@ async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elapsed = now - _last_claim_ts
     if _last_claim_ts > 0 and elapsed < CLAIM_COOLDOWN_SECONDS:
         remaining_h = (CLAIM_COOLDOWN_SECONDS - elapsed) / 3600
+        amounts_line = ""
+        if _last_claim_amounts:
+            amounts_line = (
+                f"\nLast claim: <b>{_fmt_weth(_last_claim_amounts['weth'])} WETH</b>"
+                f" · <b>{_fmt_drb_millions(_last_claim_amounts['drb'])} DRB</b>"
+            )
         tx_line = ""
         if _last_claim_tx:
             tx_line = f'\n🔗 <a href="https://basescan.org/tx/{_last_claim_tx}">Last claim tx</a>'
         await msg.reply_text(
-            f"⏳ Too soon! Next claim available in <b>{remaining_h:.1f}h</b>.{tx_line}",
+            f"⏳ Too soon! Next claim available in <b>{remaining_h:.1f}h</b>.{amounts_line}{tx_line}",
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -1966,9 +2041,11 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         weth = result["weth_claimed"]
         drb = result["drb_claimed"]
 
-        global _last_claim_ts, _last_claim_tx
+        global _last_claim_ts, _last_claim_tx, _last_claim_amounts
         _last_claim_ts = time.time()
         _last_claim_tx = result["tx_hash"]
+        _last_claim_amounts = {"weth": float(weth), "drb": float(drb)}
+        _save_last_claim()
 
         # Invalidate the pending-rewards estimate cache (it just changed)
         _CLAIM_EST_CACHE["ts"] = 0
@@ -2922,6 +2999,7 @@ async def on_startup(app):
         except Exception:
             pass
     _ensure_data_dir()
+    _load_last_claim()
     app.bot_data["monitor_task"] = asyncio.create_task(buy_monitor(app))
     if ADMIN_ID > 0:
         try:
