@@ -1303,9 +1303,80 @@ def generate_stats_chart(days: int):
     return BytesIO(png), sum(drb_vals), sum(weth_vals), growth, growth_pct
 
 
+# ---- /stats total: all-time claimed fees ----
+# Baseline hardcoded (computed 2026-08-25, covering everything up to 2026-08-24
+# 23:59 UTC / block 50,398,573). At runtime only blocks AFTER the baseline are
+# scanned and added, so the command stays fast with no persistent disk.
+FEES_SOURCES = {
+    "0x5ec4f99f342038c67a312a166ff56e6d70383d86",  # fee distributor -> grok wallet
+    CLAIM_CONTRACT.lower(),
+}
+FEES_BASELINE = {
+    "block": 50_398_573,          # last block included in the baseline
+    "drb": 4_402_794_413.596866,  # DRB claimed up to the baseline
+    "weth": 145.794064,           # WETH claimed up to the baseline
+}
+_STATS_TOTAL_CACHE = {"ts": 0.0, "text": None}
+
+
+def build_stats_total_text() -> str:
+    now = time.time()
+    if _STATS_TOTAL_CACHE["text"] and (now - _STATS_TOTAL_CACHE["ts"]) < 300:
+        return _STATS_TOTAL_CACHE["text"]
+
+    start = FEES_BASELINE["block"] + 1
+    drb_total = FEES_BASELINE["drb"]
+    weth_total = FEES_BASELINE["weth"]
+    wallet_l = GROK_WALLET.lower()
+
+    for token, key in ((DRB_TOKEN, "drb"), (WETH_TOKEN, "weth")):
+        txs = fetch_token_transfers(token, GROK_WALLET, startblock=start)
+        amt = sum(
+            _tx_amount(t) for t in txs
+            if (t.get("to") or "").lower() == wallet_l
+            and (t.get("from") or "").lower() in FEES_SOURCES
+            and int(t.get("blockNumber") or 0) >= start
+        )
+        if key == "drb":
+            drb_total += amt
+        else:
+            weth_total += amt
+
+    try:
+        drb_usd = drb_total * fetch_price_usd(DRB_TOKEN)
+    except Exception:
+        drb_usd = None
+    try:
+        weth_usd = weth_total * fetch_price_usd(WETH_TOKEN)
+    except Exception:
+        weth_usd = None
+
+    lines = ["💰 <b>Total Fees Claimed</b>", ""]
+    drb_usd_str = f" ({_fmt_int_usd(drb_usd)})" if drb_usd is not None else ""
+    weth_usd_str = f" ({_fmt_int_usd(weth_usd)})" if weth_usd is not None else ""
+    lines.append(f"DRB: <b>{_fmt_big(drb_total)}</b>{drb_usd_str}")
+    lines.append(f"WETH: <b>{weth_total:,.2f}</b>{weth_usd_str}")
+    if drb_usd is not None and weth_usd is not None:
+        lines.append("")
+        lines.append(f"Total: <b>{_fmt_int_usd(drb_usd + weth_usd)}</b>")
+    text = "\n".join(lines)
+    _STATS_TOTAL_CACHE.update(ts=now, text=text)
+    return text
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
+        return
+
+    # /stats total -> all-time claimed fees summary
+    if context.args and str(context.args[0]).strip().lower() == "total":
+        try:
+            text = await asyncio.get_event_loop().run_in_executor(None, build_stats_total_text)
+            await msg.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as e:
+            print("stats total error:", repr(e))
+            await msg.reply_text("Error building total stats")
         return
 
     days = _parse_stats_period(context.args)
@@ -2454,12 +2525,16 @@ def _buy_from_receipt(tx_hash: str, receipt: dict, allow_live_eth_fallback: bool
     except Exception:
         pass
 
-    # Final receiver must be a person: an EOA, or a smart-contract wallet (Safe / AA /
-    # Coinbase Smart Wallet...) that is the sender OR the direct target of the tx
-    # (owner EOA executing their own smart wallet). Any other contract (pool, router,
-    # locker) is not a personal buy.
+    # Final receiver must be a person: an EOA, or a smart-contract wallet.
+    # Accepted contract-buyer cases:
+    #   a) buyer == tx.from  (account-abstraction wallet sending its own tx)
+    #   b) buyer == tx.to    (owner EOA executing their own smart wallet)
+    #   c) third-party smart wallet funded via an intent/solver settlement
+    #      (relayer sends the tx, DRB lands on the user's wallet). For (c) we
+    #      demand a strict coherence check later so pools/lockers never pass.
+    third_party_contract_buyer = False
     if _is_contract(buyer, block_number) and _norm(buyer) not in (tx_from, tx_to):
-        return None
+        third_party_contract_buyer = True
 
     tokens_delta = int(tdel.get(buyer, 0))
     if tokens_delta <= 0:
@@ -2514,6 +2589,12 @@ def _buy_from_receipt(tx_hash: str, receipt: dict, allow_live_eth_fallback: bool
     # Coherence filter (stable-paid buys only; ETH/WETH price estimates can drift)
     if not paid_with_eth and not paid_with_weth and usd_est > 0:
         if spent_usd < usd_est * 0.10 or spent_usd > usd_est * 8.0:
+            return None
+    # Third-party contract buyers (intent/solver settlements) must ALWAYS pass a
+    # strict coherence check, whatever the payment token — this is what keeps
+    # random contracts receiving DRB from ever counting as buys.
+    if third_party_contract_buyer:
+        if usd_est <= 0 or spent_usd < usd_est * 0.5 or spent_usd > usd_est * 2.0:
             return None
 
     return {
