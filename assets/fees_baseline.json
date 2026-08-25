@@ -1,0 +1,9 @@
+{
+  "computed_at": "2026-08-25",
+  "block": 50398573,
+  "drb": 4402794413.596866,
+  "weth": 145.794064,
+  "drb_usd": 363395.35,
+  "weth_usd": 342802.04,
+  "note": "Claims to Grok wallet from 0x5ec4f99f...3d86 + claim contract, up to 2026-08-24 23:59 UTC. USD at claim time (DRB daily close GeckoTerminal, WETH Chainlink per block)."
+}
