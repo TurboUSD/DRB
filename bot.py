@@ -825,6 +825,117 @@ def fetch_balances_cached():
     return data
 
 
+# ================= ANTI-SPAM GUARD =================
+# Per-user sliding window over commands (private and group). Admin exempt.
+RATE_LIMIT_N = int(os.environ.get("RATE_LIMIT_N", "5"))        # max commands
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))  # seconds
+_RATE_CALLS: dict = {}   # user_id -> [timestamps]
+_RATE_WARNED: dict = {}  # user_id -> last warn ts
+_RATE_ADMIN_NOTIFIED: dict = {}  # user_id -> last admin-alert ts
+_RATE_BLOCKED_COUNT: dict = {}   # user_id -> commands blocked since last admin alert
+RATE_ADMIN_ALERT_COOLDOWN = int(os.environ.get("RATE_ADMIN_ALERT_COOLDOWN", "1800"))  # 30 min
+BLACKLIST_THRESHOLD = int(os.environ.get("BLACKLIST_THRESHOLD", "15"))  # blocked cmds -> auto-blacklist
+_BLACKLIST_CACHE = {"ts": 0.0, "ids": set()}
+
+
+def _blacklist() -> set:
+    now = time.time()
+    if now - _BLACKLIST_CACHE["ts"] > 30:
+        _BLACKLIST_CACHE["ids"] = set(_load_state().get("blacklist") or [])
+        _BLACKLIST_CACHE["ts"] = now
+    return _BLACKLIST_CACHE["ids"]
+
+
+def _blacklist_set(uid: int, blocked: bool) -> None:
+    def _m(st):
+        cur = set(int(u) for u in (st.get("blacklist") or []))
+        (cur.add(int(uid)) if blocked else cur.discard(int(uid)))
+        st["blacklist"] = sorted(cur)
+    _update_state_fields(_m)
+    _BLACKLIST_CACHE["ts"] = 0.0
+
+
+async def command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram.ext import ApplicationHandlerStop
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if ADMIN_ID > 0 and user.id == ADMIN_ID:
+        return
+    from telegram.ext import ApplicationHandlerStop as _Stop
+    if user.id in _blacklist():
+        raise _Stop()  # blacklisted: ignore silently
+    now = time.time()
+    q = [t for t in _RATE_CALLS.get(user.id, []) if now - t < RATE_LIMIT_WINDOW]
+    if len(q) >= RATE_LIMIT_N:
+        _RATE_CALLS[user.id] = q
+        _RATE_BLOCKED_COUNT[user.id] = _RATE_BLOCKED_COUNT.get(user.id, 0) + 1
+        # Warn at most once a minute per user; otherwise drop silently
+        if now - _RATE_WARNED.get(user.id, 0) > 60:
+            _RATE_WARNED[user.id] = now
+            try:
+                await msg.reply_text("\u23F3 Slow down — try again in a minute.")
+            except Exception:
+                pass
+        blocked_total = _RATE_BLOCKED_COUNT.get(user.id, 0)
+        uname = f"@{user.username}" if user.username else (user.full_name or "?")
+        chat = update.effective_chat
+        where = "private" if (chat and chat.type == "private") else f"group {getattr(chat, 'title', '') or chat.id}".strip()
+        cmd = (msg.text or "")[:60]
+
+        # Persistent offender -> auto-blacklist + admin alert with an Unblock button
+        if blocked_total >= BLACKLIST_THRESHOLD and user.id not in _blacklist():
+            _blacklist_set(user.id, True)
+            _RATE_BLOCKED_COUNT.pop(user.id, None)
+            if ADMIN_ID > 0:
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "\u2705 Unblock", callback_data=f"blk:un:{user.id}")]])
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            "\U0001F6D1 <b>User auto-blacklisted for spamming</b>\n"
+                            f"User: {uname}\n"
+                            f"ID: <code>{user.id}</code>\n"
+                            f"Where: {where}\n"
+                            f"Blocked commands: {blocked_total} (limit {RATE_LIMIT_N}/{RATE_LIMIT_WINDOW}s)\n"
+                            f"Last command: <code>{cmd}</code>\n\n"
+                            "The bot now ignores this user everywhere."
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=kb,
+                    )
+                except Exception:
+                    pass
+            raise ApplicationHandlerStop()
+
+        # First-level alert to the admin (at most once per user per cooldown)
+        if ADMIN_ID > 0 and now - _RATE_ADMIN_NOTIFIED.get(user.id, 0) > RATE_ADMIN_ALERT_COOLDOWN:
+            _RATE_ADMIN_NOTIFIED[user.id] = now
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "\u26A0\uFE0F Rate limit hit\n"
+                        f"User: {uname} (id {user.id})\n"
+                        f"Where: {where}\n"
+                        f"Blocked commands: {blocked_total} (limit {RATE_LIMIT_N}/{RATE_LIMIT_WINDOW}s)\n"
+                        f"Last: {cmd}\n"
+                        f"Auto-blacklist at {BLACKLIST_THRESHOLD} blocked commands."
+                    ),
+                )
+            except Exception:
+                pass
+        raise ApplicationHandlerStop()
+    q.append(now)
+    _RATE_CALLS[user.id] = q
+    if len(_RATE_CALLS) > 2000:  # bound memory
+        cutoff = now - RATE_LIMIT_WINDOW
+        for uid in [u for u, ts in _RATE_CALLS.items() if not ts or ts[-1] < cutoff]:
+            _RATE_CALLS.pop(uid, None)
+
+
 # ================= COMMANDS =================
 
 async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1470,6 +1581,8 @@ async def admin_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         dest = _FEES_BASELINE_FILE
     elif name == "transfers_cache.json":
         dest = _INCR_TRANSFERS_FILE
+    elif name == "watch_state.json":
+        dest = STATE_PATH
     else:
         return
     try:
@@ -1479,8 +1592,10 @@ async def admin_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if name == "fees_baseline.json":
             _load_fees_baseline_file()
             _STATS_TOTAL_CACHE.update(ts=0.0, text=None)
-        else:
+        elif name == "transfers_cache.json":
             _INCR_TRANSFERS_CACHE.clear()
+        elif name == "watch_state.json":
+            _BLACKLIST_CACHE["ts"] = 0.0  # reload blacklist and settings
         await msg.reply_text(f"\u2705 {name} restored ({os.path.getsize(dest):,} bytes).")
     except Exception as e:
         await msg.reply_text(f"Error saving {name}: {e!r}")
@@ -2323,6 +2438,7 @@ DEFAULT_STATE = {
     "min_usd": {"buy": DEFAULT_MIN_BUY_USD},
     "emoji_usd": {"buy": DEFAULT_EMOJI_USD},
     "alerts_dm": True,
+    "blacklist": [],    # user ids blocked for spamming (auto; admin can unblock)
     "alert_chats": [],  # groups/channels where the bot has been added (auto-registered)
     "watch": {
         "last_scanned_block": 0,
@@ -2358,6 +2474,8 @@ def _load_state() -> dict:
             merged["alerts_dm"] = bool(s["alerts_dm"])
         if isinstance(s.get("alert_chats"), list):
             merged["alert_chats"] = [int(c) for c in s["alert_chats"] if str(c).lstrip("-").isdigit()]
+        if isinstance(s.get("blacklist"), list):
+            merged["blacklist"] = [int(u) for u in s["blacklist"] if str(u).isdigit()]
         w = s.get("watch") or {}
         if isinstance(w, dict):
             merged["watch"]["last_scanned_block"] = int(w.get("last_scanned_block") or 0)
@@ -3232,6 +3350,66 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def blacklist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    user = update.effective_user
+    if not (ADMIN_ID > 0 and user and user.id == ADMIN_ID):
+        await query.answer("\u26D4 Admin only.", show_alert=True)
+        return
+    data = query.data or ""
+    if data.startswith("blk:un:"):
+        try:
+            uid = int(data.split(":")[2])
+        except Exception:
+            await query.answer()
+            return
+        _blacklist_set(uid, False)
+        _RATE_CALLS.pop(uid, None)
+        _RATE_ADMIN_NOTIFIED.pop(uid, None)
+        await query.answer("Unblocked.")
+        try:
+            await query.edit_message_text(
+                (query.message.text_html or query.message.text or "") +
+                "\n\n\u2705 <b>Unblocked by admin.</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /backup -> the bot sends you the current state file (blacklist,
+    min buy, groups, sent-alert dedup). Send it back after a redeploy to restore."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user or not (ADMIN_ID > 0 and user.id == ADMIN_ID):
+        return
+    if not os.path.exists(STATE_PATH):
+        await msg.reply_text("No state file yet.")
+        return
+    with open(STATE_PATH, "rb") as f:
+        await msg.reply_document(
+            document=f, filename="watch_state.json",
+            caption="Current state. Send this file back to me after a redeploy to restore it.")
+
+
+async def blacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /blacklist -> list blocked users with Unblock buttons."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user or not (ADMIN_ID > 0 and user.id == ADMIN_ID):
+        return
+    ids = sorted(_blacklist())
+    if not ids:
+        await msg.reply_text("Blacklist empty.")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"\u2705 Unblock {uid}", callback_data=f"blk:un:{uid}")]
+                               for uid in ids[:30]])
+    await msg.reply_text(f"\U0001F6D1 Blacklisted users ({len(ids)}):", reply_markup=kb)
+
+
 async def _count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Increment per-chat message counter for non-admin warning cooldown."""
     context.chat_data["msg_count"] = context.chat_data.get("msg_count", 0) + 1
@@ -3285,6 +3463,10 @@ def main():
     app.add_handler(CommandHandler("setemoji", setemoji_command))
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("scan", scan_command))
+    app.add_handler(CommandHandler("blacklist", blacklist_command))
+    app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CallbackQueryHandler(blacklist_callback, pattern=r"^blk:"))
+    app.add_handler(MessageHandler(filters.COMMAND, command_guard, block=True), group=-1)
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, admin_file_handler), group=0)
     app.add_handler(MessageHandler(filters.ALL, _count_message), group=1)
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
