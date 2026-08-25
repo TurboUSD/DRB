@@ -1174,6 +1174,23 @@ def _daily_claims(txs: list, days: int, end_date) -> tuple:
     return dates, [daily.get(d, 0.0) for d in dates]
 
 
+def _daily_claims_usd(txs: list, days: int, end_date, px_map: dict) -> tuple:
+    """Daily USD value of claims (each day's amount x that day's close price)."""
+    wallet_l = GROK_WALLET.lower()
+    incoming = [t for t in txs if (t.get("to") or "").lower() == wallet_l]
+    from_src = [t for t in incoming if (t.get("from") or "").lower() in FEES_SOURCES]
+    use = from_src if from_src else incoming
+
+    daily = {}
+    for t in use:
+        ts_ = int(t["timeStamp"])
+        d = datetime.fromtimestamp(ts_, tz=timezone.utc).date()
+        daily[d] = daily.get(d, 0.0) + _tx_amount(t) * _px_on_day(px_map, ts_)
+
+    dates = [end_date - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    return dates, [daily.get(d, 0.0) for d in dates]
+
+
 def _drb_balance_series(txs: list) -> list:
     """Running DRB balance of the Grok wallet over time: [(timestamp, balance), ...]."""
     wallet_l = GROK_WALLET.lower()
@@ -1208,7 +1225,7 @@ def generate_stats_chart(days: int):
     now = time.time()
     c = _STATS_RESULT_CACHE.get(days)
     if c and (now - c["ts"]) < _STATS_RESULT_TTL:
-        return BytesIO(c["png"]), c["drb_total"], c["weth_total"], c["growth"], c["growth_pct"]
+        return BytesIO(c["png"]), c["drb_total"], c["weth_total"], c["growth"], c["growth_pct"], c.get("usd_total", 0.0)
 
     drb_txs = fetch_token_transfers_incremental(DRB_TOKEN, GROK_WALLET)
     weth_txs = fetch_token_transfers_incremental(WETH_TOKEN, GROK_WALLET)
@@ -1219,23 +1236,24 @@ def generate_stats_chart(days: int):
     dates, drb_vals = _daily_claims(drb_txs, days, end_date)
     _, weth_vals = _daily_claims(weth_txs, days, end_date)
 
+    # USD value at claim time (daily closes: DRB pool + WETH pool)
+    maps = _daily_price_maps()
+    _, drb_usd_vals = _daily_claims_usd(drb_txs, days, end_date, maps["drb"])
+    _, weth_usd_vals = _daily_claims_usd(weth_txs, days, end_date, maps["eth"])
+
     fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(11, 10))
     fig.subplots_adjust(hspace=0.42)
 
-    # ---- Bar chart: claims per day (two bars per day, twin axes) ----
+    # ---- Bar chart: USD value of claims per day (stacked DRB + WETH) ----
     x = list(range(len(dates)))
-    width = 0.4
-    ax1.bar([i - width / 2 for i in x], drb_vals, width=width, color=DRB_COLOR, label="DRB")
-    ax2 = ax1.twinx()
-    ax2.bar([i + width / 2 for i in x], weth_vals, width=width, color=WETH_COLOR, label="WETH")
+    width = 0.62
+    ax1.bar(x, drb_usd_vals, width=width, color=DRB_COLOR, label="DRB")
+    ax1.bar(x, weth_usd_vals, width=width, bottom=drb_usd_vals, color=WETH_COLOR, label="WETH")
 
-    ax1.set_title(f"Fees claimed per day — last {days}d", fontsize=16, fontweight="bold")
-    ax1.set_ylabel("DRB", color=DRB_COLOR, fontweight="bold")
-    ax2.set_ylabel("WETH", color=WETH_COLOR, fontweight="bold")
-    ax1.tick_params(axis="y", labelcolor=DRB_COLOR)
-    ax2.tick_params(axis="y", labelcolor=WETH_COLOR)
-    ax1.yaxis.set_major_formatter(FuncFormatter(lambda v, _: _fmt_big(v)))
-    ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    ax1.set_title(f"Fees claimed per day (USD at claim time) — last {days}d",
+                  fontsize=16, fontweight="bold")
+    ax1.set_ylabel("USD", fontweight="bold")
+    ax1.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:,.0f}"))
 
     step = max(1, len(dates) // 10)
     ax1.set_xticks(x[::step])
@@ -1243,7 +1261,6 @@ def generate_stats_chart(days: int):
     ax1.grid(axis="y", alpha=0.22)
     ax1.set_axisbelow(True)
     ax1.set_ylim(bottom=0)
-    ax2.set_ylim(bottom=0)
     ax1.legend(
         handles=[Patch(color=DRB_COLOR, label="DRB"), Patch(color=WETH_COLOR, label="WETH")],
         loc="upper left",
@@ -1297,10 +1314,11 @@ def generate_stats_chart(days: int):
         "png": png,
         "drb_total": sum(drb_vals),
         "weth_total": sum(weth_vals),
+        "usd_total": sum(drb_usd_vals) + sum(weth_usd_vals),
         "growth": growth,
         "growth_pct": growth_pct,
     }
-    return BytesIO(png), sum(drb_vals), sum(weth_vals), growth, growth_pct
+    return BytesIO(png), sum(drb_vals), sum(weth_vals), growth, growth_pct, sum(drb_usd_vals) + sum(weth_usd_vals)
 
 
 # ---- /stats total: all-time claimed fees ----
@@ -1312,11 +1330,160 @@ FEES_SOURCES = {
     CLAIM_CONTRACT.lower(),
 }
 FEES_BASELINE = {
-    "block": 50_398_573,          # last block included in the baseline
-    "drb": 4_402_794_413.596866,  # DRB claimed up to the baseline
-    "weth": 145.794064,           # WETH claimed up to the baseline
+    "block": 50_398_573,           # last block included in the baseline
+    "drb": 4_402_794_413.596866,   # DRB claimed up to the baseline
+    "weth": 145.794064,            # WETH claimed up to the baseline
+    # USD value AT CLAIM TIME (DRB: daily close via GeckoTerminal OHLCV;
+    # WETH: Chainlink ETH/USD at each claim's block). Computed 2026-08-25.
+    "drb_usd": 363_395.35,
+    "weth_usd": 342_802.04,
 }
+
+# ---- daily close price maps (for valuing claims at claim time) ----
+_DAY_PX_CACHE = {"ts": 0.0, "drb": {}, "eth": {}}
+_DAY_PX_TTL = 3600
+
+
+def _gt_pool_day_closes(pool_addr: str) -> dict:
+    """{'YYYY-MM-DD': close_usd} from GeckoTerminal daily OHLCV (up to 1000 days)."""
+    out = {}
+    r = requests.get(
+        f"https://api.geckoterminal.com/api/v2/networks/base/pools/{pool_addr}/ohlcv/day",
+        params={"limit": 1000, "currency": "usd"},
+        headers={"accept": "application/json"}, timeout=20)
+    r.raise_for_status()
+    for ts, _o, _h, _l, c, _v in (((r.json().get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []):
+        day = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+        out[day] = float(c)
+    return out
+
+
+_WETH_POOL_CACHE = {"ts": 0.0, "pair": None}
+
+
+def _weth_main_pool() -> str:
+    now = time.time()
+    if _WETH_POOL_CACHE["pair"] and (now - _WETH_POOL_CACHE["ts"]) < 86400:
+        return _WETH_POOL_CACHE["pair"]
+    r = requests.get(DEXSCREENER_TOKEN_URL + WETH_TOKEN, headers=UA_HEADERS, timeout=15)
+    r.raise_for_status()
+    best, best_liq = None, -1.0
+    for pr in (r.json().get("pairs") or []):
+        try:
+            if (pr.get("chainId") or "").lower() != "base":
+                continue
+            liq = float((pr.get("liquidity") or {}).get("usd") or 0)
+            if liq > best_liq and pr.get("pairAddress"):
+                best, best_liq = str(pr["pairAddress"]).lower(), liq
+        except Exception:
+            continue
+    if best:
+        _WETH_POOL_CACHE.update(ts=now, pair=best)
+    return best or ""
+
+
+def _daily_price_maps():
+    """Cached {'drb': {day: px}, 'eth': {day: px}} of daily USD closes."""
+    now = time.time()
+    if _DAY_PX_CACHE["drb"] and (now - _DAY_PX_CACHE["ts"]) < _DAY_PX_TTL:
+        return _DAY_PX_CACHE
+    try:
+        pool = _get_main_pool()
+        if pool:
+            _DAY_PX_CACHE["drb"] = _gt_pool_day_closes(pool["pair"]) or _DAY_PX_CACHE["drb"]
+    except Exception as e:
+        print("drb day prices error:", repr(e))
+    try:
+        wp = _weth_main_pool()
+        if wp:
+            _DAY_PX_CACHE["eth"] = _gt_pool_day_closes(wp) or _DAY_PX_CACHE["eth"]
+    except Exception as e:
+        print("eth day prices error:", repr(e))
+    _DAY_PX_CACHE["ts"] = now
+    return _DAY_PX_CACHE
+
+
+def _px_on_day(px_map: dict, ts: int, fallback: float = 0.0) -> float:
+    if not px_map:
+        return fallback
+    d = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+    if d in px_map:
+        return px_map[d]
+    earlier = [k for k in px_map if k <= d]
+    if earlier:
+        return px_map[max(earlier)]
+    return px_map[min(px_map)]
 _STATS_TOTAL_CACHE = {"ts": 0.0, "text": None}
+
+_FEES_BASELINE_FILE = os.path.join(DATA_PATH, "fees_baseline.json")
+
+
+def _load_fees_baseline_file() -> None:
+    """Baseline priority: DATA_PATH/fees_baseline.json (sent by the admin at
+    runtime) > assets/fees_baseline.json (shipped with the deploy) > hardcoded."""
+    for path in (_FEES_BASELINE_FILE, "assets/fees_baseline.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            for k in ("block", "drb", "weth", "drb_usd", "weth_usd"):
+                if k in j:
+                    FEES_BASELINE[k] = type(FEES_BASELINE[k])(j[k])
+            print(f"[fees] baseline loaded from {path} (block {FEES_BASELINE['block']})")
+            return
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            print(f"fees baseline load error ({path}):", repr(e))
+
+
+def _seed_transfers_cache_from_assets() -> None:
+    """If the incremental transfers cache is missing (fresh container) but a copy
+    was shipped in assets/, seed it from there to skip the full-history rescan."""
+    try:
+        if os.path.exists(_INCR_TRANSFERS_FILE):
+            return
+        src = "assets/transfers_cache.json"
+        if os.path.exists(src):
+            import shutil
+            os.makedirs(os.path.dirname(_INCR_TRANSFERS_FILE) or ".", exist_ok=True)
+            shutil.copy(src, _INCR_TRANSFERS_FILE)
+            print(f"[fees] transfers cache seeded from {src} ({os.path.getsize(src):,} bytes)")
+    except Exception as e:
+        print("transfers cache seed error:", repr(e))
+
+
+_load_fees_baseline_file()
+_seed_transfers_cache_from_assets()
+
+
+async def admin_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin sends fees_baseline.json or transfers_cache.json in private ->
+    saved to disk and picked up immediately (recovers precomputed work after a reset)."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user or not msg.document:
+        return
+    if ADMIN_ID <= 0 or user.id != ADMIN_ID or msg.chat.type != "private":
+        return
+    name = (msg.document.file_name or "").strip()
+    if name == "fees_baseline.json":
+        dest = _FEES_BASELINE_FILE
+    elif name == "transfers_cache.json":
+        dest = _INCR_TRANSFERS_FILE
+    else:
+        return
+    try:
+        f = await msg.document.get_file()
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        await f.download_to_drive(dest)
+        if name == "fees_baseline.json":
+            _load_fees_baseline_file()
+            _STATS_TOTAL_CACHE.update(ts=0.0, text=None)
+        else:
+            _INCR_TRANSFERS_CACHE.clear()
+        await msg.reply_text(f"\u2705 {name} restored ({os.path.getsize(dest):,} bytes).")
+    except Exception as e:
+        await msg.reply_text(f"Error saving {name}: {e!r}")
 
 
 def build_stats_total_text() -> str:
@@ -1327,38 +1494,37 @@ def build_stats_total_text() -> str:
     start = FEES_BASELINE["block"] + 1
     drb_total = FEES_BASELINE["drb"]
     weth_total = FEES_BASELINE["weth"]
+    drb_usd = FEES_BASELINE["drb_usd"]
+    weth_usd = FEES_BASELINE["weth_usd"]
     wallet_l = GROK_WALLET.lower()
+    maps = _daily_price_maps()
 
+    # Claims after the baseline, each valued at ITS claim moment
     for token, key in ((DRB_TOKEN, "drb"), (WETH_TOKEN, "weth")):
         txs = fetch_token_transfers(token, GROK_WALLET, startblock=start)
-        amt = sum(
-            _tx_amount(t) for t in txs
-            if (t.get("to") or "").lower() == wallet_l
-            and (t.get("from") or "").lower() in FEES_SOURCES
-            and int(t.get("blockNumber") or 0) >= start
-        )
-        if key == "drb":
-            drb_total += amt
-        else:
-            weth_total += amt
+        for t in txs:
+            if (t.get("to") or "").lower() != wallet_l:
+                continue
+            if (t.get("from") or "").lower() not in FEES_SOURCES:
+                continue
+            if int(t.get("blockNumber") or 0) < start:
+                continue
+            amt = _tx_amount(t)
+            ts_ = int(t.get("timeStamp") or 0)
+            if key == "drb":
+                drb_total += amt
+                drb_usd += amt * _px_on_day(maps["drb"], ts_)
+            else:
+                weth_total += amt
+                px = _chainlink_eth_usd_at_block(int(t.get("blockNumber") or 0)) or _px_on_day(maps["eth"], ts_)
+                weth_usd += amt * (px or 0.0)
 
-    try:
-        drb_usd = drb_total * fetch_price_usd(DRB_TOKEN)
-    except Exception:
-        drb_usd = None
-    try:
-        weth_usd = weth_total * fetch_price_usd(WETH_TOKEN)
-    except Exception:
-        weth_usd = None
-
-    lines = ["💰 <b>Total Fees Claimed</b>", ""]
-    drb_usd_str = f" ({_fmt_int_usd(drb_usd)})" if drb_usd is not None else ""
-    weth_usd_str = f" ({_fmt_int_usd(weth_usd)})" if weth_usd is not None else ""
-    lines.append(f"DRB: <b>{_fmt_big(drb_total)}</b>{drb_usd_str}")
-    lines.append(f"WETH: <b>{weth_total:,.2f}</b>{weth_usd_str}")
-    if drb_usd is not None and weth_usd is not None:
-        lines.append("")
-        lines.append(f"Total: <b>{_fmt_int_usd(drb_usd + weth_usd)}</b>")
+    lines = ["\U0001F916 <b>Total Fees Claimed</b> \U0001F4B0", ""]
+    lines.append(f"DRB: <b>{_fmt_big(drb_total)}</b> ({_fmt_int_usd(drb_usd)})")
+    lines.append(f"WETH: <b>{weth_total:,.2f}</b> ({_fmt_int_usd(weth_usd)})")
+    lines.append("")
+    lines.append(f"Total: <b>{_fmt_int_usd(drb_usd + weth_usd)}</b>")
+    lines.append("<i>USD valued at the moment of each claim</i>")
     text = "\n".join(lines)
     _STATS_TOTAL_CACHE.update(ts=now, text=text)
     return text
@@ -1382,7 +1548,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = _parse_stats_period(context.args)
 
     try:
-        buf, drb_total, weth_total, growth, growth_pct = await asyncio.get_event_loop().run_in_executor(
+        buf, drb_total, weth_total, growth, growth_pct, usd_total = await asyncio.get_event_loop().run_in_executor(
             None, generate_stats_chart, days
         )
         if growth_pct is not None:
@@ -1392,7 +1558,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             growth_str = f"{sign}{_fmt_big(abs(growth))} DRB"
         caption = (
             f"📊 <b>Claim stats — last {days} days</b>\n"
-            f"Total claimed: <b>{_fmt_drb_millions(drb_total)} DRB</b> · <b>{_fmt_weth(weth_total)} WETH</b>\n"
+            f"Total claimed: <b>{_fmt_drb_millions(drb_total)} DRB</b> · <b>{_fmt_weth(weth_total)} WETH</b> (~<b>{_fmt_int_usd(usd_total)}</b>)\n"
             f"Grok Wallet: <b>{growth_str}</b>"
         )
         await msg.reply_photo(photo=buf, caption=caption, parse_mode="HTML")
@@ -3119,6 +3285,7 @@ def main():
     app.add_handler(CommandHandler("setemoji", setemoji_command))
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("scan", scan_command))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, admin_file_handler), group=0)
     app.add_handler(MessageHandler(filters.ALL, _count_message), group=1)
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, _register_from_message), group=2)
