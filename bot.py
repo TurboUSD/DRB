@@ -90,7 +90,7 @@ CHAINLINK_ETH_USD_FEED = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"  # ETH/USD
 TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 ASSET_BUY = os.environ.get("ASSET_BUY", "assets/DRB_buy.png")
-BUY_EMOJI = os.environ.get("BUY_EMOJI", "💸")
+BUY_EMOJI = os.environ.get("BUY_EMOJI", "🤖")
 MAX_EMOJIS = 100
 
 WATCH_POLL_SEC = max(10, int(os.environ.get("WATCH_POLL_SEC", "60")))
