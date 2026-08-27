@@ -16,7 +16,7 @@ from matplotlib.patches import Patch
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageStat
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
@@ -106,6 +106,14 @@ CHAINLINK_ETH_USD_FEED = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"  # ETH/USD
 TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 ASSET_BUY = os.environ.get("ASSET_BUY", "assets/DRB_buy.png")
+
+# ---- Watermark stamped on every image the bot sends ----
+WATERMARK_TEXT = os.environ.get("WATERMARK_TEXT", "@TonySopraNFTo")
+WATERMARK_ENABLED = os.environ.get("WATERMARK_ENABLED", "1") not in ("0", "false", "False")
+WATERMARK_HEIGHT_PCT = float(os.environ.get("WATERMARK_HEIGHT_PCT", "0.030"))  # font size vs image height
+WATERMARK_MAX_WIDTH_PCT = float(os.environ.get("WATERMARK_MAX_WIDTH_PCT", "0.22"))  # never wider than this
+WATERMARK_MARGIN_PCT = float(os.environ.get("WATERMARK_MARGIN_PCT", "0.025"))  # margin vs shortest side
+WATERMARK_OPACITY = int(os.environ.get("WATERMARK_OPACITY", "235"))            # 0-255
 BUY_EMOJI = os.environ.get("BUY_EMOJI", "🤖")
 MAX_EMOJIS = 100
 
@@ -441,6 +449,102 @@ def _try_font(paths: list[str], size: int) -> ImageFont.FreeTypeFont:
         except Exception:
             continue
     return ImageFont.load_default()
+
+
+# ================= WATERMARK =================
+
+_WM_ASSET_CACHE = {}  # path -> (mtime, watermarked_png_bytes)
+
+
+def _watermark_font(size: int):
+    return _try_font([
+        "assets/font_bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ], size)
+
+
+def apply_watermark(img: Image.Image) -> Image.Image:
+    """Stamp WATERMARK_TEXT on the bottom-right corner, in whichever of black /
+    white contrasts with what is already there (plus a thin opposite outline, so
+    it stays readable over a busy corner)."""
+    if not WATERMARK_ENABLED or not WATERMARK_TEXT:
+        return img
+    im = img.convert("RGBA")
+    W, H = im.size
+    if W < 60 or H < 40:
+        return img
+
+    probe = ImageDraw.Draw(im)
+    size = max(11, int(H * WATERMARK_HEIGHT_PCT))
+    # Shrink until the stamp fits inside its width budget, so it can never creep
+    # across the artwork on short/wide banners (the buy alert card).
+    for _ in range(24):
+        font = _watermark_font(size)
+        bbox = probe.textbbox((0, 0), WATERMARK_TEXT, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        if tw <= W * WATERMARK_MAX_WIDTH_PCT or size <= 11:
+            break
+        size -= 1
+
+    margin = max(8, int(min(W, H) * WATERMARK_MARGIN_PCT))
+    x = max(0, W - tw - margin - bbox[0])
+    y = max(0, H - th - margin - bbox[1])
+
+    # Average brightness of the area the text will cover -> pick the ink colour
+    pad = max(2, int(th * 0.25))
+    box = (max(0, x - pad), max(0, y - pad), min(W, x + tw + pad), min(H, y + th + pad))
+    try:
+        mean = ImageStat.Stat(im.crop(box).convert("L")).mean[0]
+    except Exception:
+        mean = 255.0
+    if mean >= 140:
+        ink, outline = (0, 0, 0, WATERMARK_OPACITY), (255, 255, 255, 150)
+    else:
+        ink, outline = (255, 255, 255, WATERMARK_OPACITY), (0, 0, 0, 150)
+
+    layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text(
+        (x, y), WATERMARK_TEXT, font=font, fill=ink,
+        stroke_width=max(1, int(th * 0.08)), stroke_fill=outline,
+    )
+    return Image.alpha_composite(im, layer)
+
+
+def watermark_png_bytes(data: bytes) -> bytes:
+    """Watermark a PNG/JPEG given as bytes; returns PNG bytes (original on error)."""
+    if not WATERMARK_ENABLED or not WATERMARK_TEXT:
+        return data
+    try:
+        out = BytesIO()
+        apply_watermark(Image.open(BytesIO(data))).convert("RGB").save(out, format="PNG", optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        print("watermark error:", repr(e))
+        return data
+
+
+def watermark_buf(buf: BytesIO) -> BytesIO:
+    """Watermark an in-memory image buffer (as produced by matplotlib / PIL)."""
+    buf.seek(0)
+    out = BytesIO(watermark_png_bytes(buf.read()))
+    out.seek(0)
+    return out
+
+
+def watermarked_asset(path: str) -> BytesIO:
+    """Watermarked copy of a file on disk, cached until the file changes."""
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = 0
+    cached = _WM_ASSET_CACHE.get(path)
+    if not cached or cached[0] != mtime:
+        with open(path, "rb") as f:
+            cached = (mtime, watermark_png_bytes(f.read()))
+        _WM_ASSET_CACHE[path] = cached
+    return BytesIO(cached[1])
 
 
 def _load_fonts():
@@ -856,7 +960,7 @@ def generate_balance_donut(
     plt.savefig(buf, format="png", dpi=170, bbox_inches="tight")
     buf.seek(0)
     plt.close(fig)
-    return buf
+    return watermark_buf(buf)
 
 
 def make_balance_table_caption(
@@ -1013,7 +1117,7 @@ def generate_grok_web_style_card(
     )
 
     buf = BytesIO()
-    canvas.convert("RGB").save(buf, format="PNG", optimize=True)
+    apply_watermark(canvas).convert("RGB").save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
 
@@ -3199,8 +3303,8 @@ def _buy_caption(tx_hash: str, tokens: float, usd: float, buyer: str, pay: dict 
 
 async def _send_buy_alert(app, chat_id: int, caption: str) -> None:
     if ASSET_BUY and os.path.exists(ASSET_BUY):
-        with open(ASSET_BUY, "rb") as f:
-            await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
+        await app.bot.send_photo(chat_id=chat_id, photo=watermarked_asset(ASSET_BUY),
+                                 caption=caption, parse_mode="HTML")
     else:
         await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -3479,8 +3583,8 @@ def _whale_caption(tx_hash: str, acq: dict) -> str:
 async def _send_whale_alert(app, chat_id: int, caption: str) -> None:
     asset = ASSET_WHALE if (ASSET_WHALE and os.path.exists(ASSET_WHALE)) else ASSET_BUY
     if asset and os.path.exists(asset):
-        with open(asset, "rb") as f:
-            await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
+        await app.bot.send_photo(chat_id=chat_id, photo=watermarked_asset(asset),
+                                 caption=caption, parse_mode="HTML")
     else:
         await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
 
