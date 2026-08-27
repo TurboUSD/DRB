@@ -459,13 +459,65 @@ def _try_font(paths: list[str], size: int) -> ImageFont.FreeTypeFont:
 _WM_ASSET_CACHE = {}  # path -> (mtime, watermarked_png_bytes)
 
 
+def _matplotlib_font_paths() -> list:
+    """DejaVu ships inside matplotlib, which this bot already imports, so this
+    path exists even on slim images with no system fonts installed."""
+    try:
+        base = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+        return [os.path.join(base, "DejaVuSans-Bold.ttf"), os.path.join(base, "DejaVuSans.ttf")]
+    except Exception:
+        return []
+
+
+_WM_FONT_CACHE = {}
+_WM_FONT_PATH = None
+
+
 def _watermark_font(size: int):
-    return _try_font([
+    """A REAL scalable font for the watermark.
+
+    ImageFont.load_default() is a ~10px bitmap font that ignores `size`: if the
+    lookup ever falls through to it the stamp comes out tiny no matter what
+    WATERMARK_HEIGHT_PCT says. So the candidate list ends with the DejaVu copy
+    bundled with matplotlib, which is always present."""
+    global _WM_FONT_PATH
+    cached = _WM_FONT_CACHE.get(size)
+    if cached is not None:
+        return cached
+
+    candidates = [
         "assets/font_bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    ], size)
+    ] + _matplotlib_font_paths() + [
+        "assets/font_regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+
+    font = None
+    for path in candidates:
+        try:
+            font = ImageFont.truetype(path, size=size)
+            _WM_FONT_PATH = path
+            break
+        except Exception:
+            continue
+    if font is None:
+        try:
+            font = ImageFont.load_default(size=size)  # Pillow >= 10.1
+            _WM_FONT_PATH = "PIL default (scalable)"
+        except Exception:
+            font = ImageFont.load_default()           # fixed ~10px bitmap
+            _WM_FONT_PATH = "PIL default (BITMAP - watermark will look tiny)"
+    _WM_FONT_CACHE[size] = font
+    return font
+
+
+def watermark_font_info() -> str:
+    _watermark_font(40)
+    return _WM_FONT_PATH or "?"
 
 
 def apply_watermark(img: Image.Image, width_pct: float = None) -> Image.Image:
@@ -4022,7 +4074,10 @@ async def on_startup(app):
     app.bot_data["whale_task"] = asyncio.create_task(whale_monitor(app))
     if ADMIN_ID > 0:
         try:
-            await app.bot.send_message(chat_id=ADMIN_ID, text=f"ASSET_BUY={ASSET_BUY} exists={os.path.exists(ASSET_BUY)}")
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(f"ASSET_BUY={ASSET_BUY} exists={os.path.exists(ASSET_BUY)}\n"
+                      f"watermark={'on' if WATERMARK_ENABLED else 'off'} font={watermark_font_info()}"))
         except Exception:
             pass
 
