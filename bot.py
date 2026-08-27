@@ -45,6 +45,21 @@ DRB_TOKEN = "0x3ec2156d4c0a9cbdab4a016633b7bcf6a8d68ea2"
 WETH_TOKEN = "0x4200000000000000000000000000000000000006"
 USDC_TOKEN = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
+# Ethereum mainnet: the grok wallet also holds native ETH there (~2 ETH)
+ETH_MAINNET_RPC_URL = os.environ.get("ETH_MAINNET_RPC_URL", "").strip() or "https://ethereum-rpc.publicnode.com"
+ETH_MAINNET_FALLBACK_RPC_URL = os.environ.get("ETH_MAINNET_FALLBACK_RPC_URL", "").strip() or "https://eth.llamarpc.com"
+INCLUDE_MAINNET_ETH = os.environ.get("INCLUDE_MAINNET_ETH", "1") not in ("0", "false", "False")
+
+# "Other tokens": every other ERC-20 the grok wallet holds on Base (PAWS, CHEAPZ, ...)
+# Discovered automatically and priced through DexScreener; only pairs with real
+# liquidity count, so airdropped spam with a fake pool never inflates the total.
+PAWS_TOKEN = "0x0Acb8f6a6f1a8DF2b4846db0352cAaA01d854bF8"
+OTHER_TOKENS_MIN_LIQ_USD = float(os.environ.get("OTHER_TOKENS_MIN_LIQ_USD", "10000"))
+OTHER_TOKENS_MIN_VALUE_USD = float(os.environ.get("OTHER_TOKENS_MIN_VALUE_USD", "1"))
+OTHER_TOKENS_MAX_SCAN = int(os.environ.get("OTHER_TOKENS_MAX_SCAN", "1500"))
+# Always priced even if the auto-discovery call fails
+OTHER_TOKENS_FORCE = [t.strip() for t in os.environ.get("OTHER_TOKENS_FORCE", PAWS_TOKEN).split(",") if t.strip()]
+
 # Claim fees config
 CLAIM_CONTRACT = "0x375c15db32d28cecdcab5c03ab889bf15cbd2c5e"
 CLAIM_RECIPIENT = "0x3ec2156D4c0A9CBdAB4a016633b7BcF6a8d68Ea2"
@@ -73,6 +88,7 @@ DRB_COLOR = "#0a0b0b"
 WETH_COLOR = "#6c23e0"
 ETH_COLOR = "#4a1a9e"   # lila más oscuro que WETH
 USDC_COLOR = "#55aaff"  # azul más claro para diferenciarse del lila
+OTHER_COLOR = "#8a8f98"  # gris para el resto de tokens
 
 # Save the starfield background as this file
 GROK_BG_PATH = "assets/grok_wallet_bg.png"
@@ -103,6 +119,13 @@ BUY_RECEIPT_PREFILTER_PCT = float(os.environ.get("BUY_RECEIPT_PREFILTER_PCT", "0
 DEFAULT_MIN_BUY_USD = float(os.environ.get("DEFAULT_MIN_BUY_USD", "10000"))   # used when no saved state exists
 DEFAULT_EMOJI_USD = float(os.environ.get("DEFAULT_EMOJI_USD", "1000"))  # $1000 per emoji -> $10k = 40 emojis, 100 emojis at $25k+
 
+# ---- Whale watcher (a single wallet we follow: every DRB it accumulates) ----
+WHALE_WALLET = os.environ.get("WHALE_WALLET", "0x0593b094C43E15669F0F22628AB6Cb7D670578f0").strip()
+WHALE_EMOJI = os.environ.get("WHALE_EMOJI", "\U0001F40B")
+ASSET_WHALE = os.environ.get("ASSET_WHALE", "assets/DRB_whale.png")
+DEFAULT_MIN_WHALE_USD = float(os.environ.get("DEFAULT_MIN_WHALE_USD", "1000"))
+DEFAULT_WHALE_EMOJI_USD = float(os.environ.get("DEFAULT_WHALE_EMOJI_USD", "1000"))
+
 DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
 
@@ -132,6 +155,34 @@ def _rpc_call(method: str, params: list):
             if url == BASE_FALLBACK_RPC_URL:
                 raise
             continue
+
+
+def _mainnet_rpc_call(method: str, params: list):
+    """Same as _rpc_call but against Ethereum mainnet."""
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    for url in [ETH_MAINNET_RPC_URL, ETH_MAINNET_FALLBACK_RPC_URL]:
+        try:
+            r = requests.post(url, json=payload, headers=UA_HEADERS, timeout=20)
+            r.raise_for_status()
+            j = r.json()
+            if "error" in j:
+                raise RuntimeError(str(j["error"]))
+            return j["result"]
+        except Exception:
+            if url == ETH_MAINNET_FALLBACK_RPC_URL:
+                raise
+            continue
+
+
+def fetch_mainnet_eth_balance(wallet: str) -> float:
+    """Native ETH balance of `wallet` on Ethereum mainnet (0.0 if unreachable)."""
+    if not INCLUDE_MAINNET_ETH:
+        return 0.0
+    try:
+        return int(_mainnet_rpc_call("eth_getBalance", [wallet, "latest"]), 16) / 10 ** 18
+    except Exception as e:
+        print("mainnet eth balance error:", repr(e))
+        return 0.0
 
 
 def _pad32_hex_address(addr: str) -> str:
@@ -528,6 +579,136 @@ def draw_box_text_centered(
     draw.text((px, start_y + h1 + gap1 + h2 + gap2), usd, font=font_usd, fill=color_usd)
 
 
+# ================= OTHER TOKENS (auto-discovered) =================
+
+_OTHER_TOKENS_CACHE = {"ts": 0.0, "data": None}
+_OTHER_TOKENS_TTL = 900  # 15 minutes
+
+# Tokens already shown on their own line in /grok -> never counted as "other"
+def _other_tokens_excluded() -> set:
+    return {_norm(DRB_TOKEN), _norm(WETH_TOKEN), _norm(USDC_TOKEN), _norm(USDT_TOKEN)}
+
+
+def _alchemy_erc20_balances(wallet: str) -> dict:
+    """{token_addr_lower: raw_balance} for every ERC-20 with a non-zero balance."""
+    out, page_key, guard = {}, None, 0
+    while guard < 40:
+        guard += 1
+        params = [wallet, "erc20"] if not page_key else [wallet, "erc20", {"pageKey": page_key}]
+        res = _rpc_call("alchemy_getTokenBalances", params) or {}
+        for t in res.get("tokenBalances") or []:
+            try:
+                raw = int(t.get("tokenBalance") or "0x0", 16)
+            except Exception:
+                continue
+            if raw > 0:
+                out[_norm(t.get("contractAddress"))] = raw
+        page_key = res.get("pageKey")
+        if not page_key or len(out) >= OTHER_TOKENS_MAX_SCAN:
+            break
+    return out
+
+
+def _dexscreener_batch_prices(addrs: list) -> dict:
+    """{token: {'price':p,'liq':l,'symbol':s}} using the most liquid Base pair of each token."""
+    best = {}
+    for i in range(0, len(addrs), 30):
+        chunk = addrs[i:i + 30]
+        try:
+            r = requests.get(DEXSCREENER_TOKEN_URL + ",".join(chunk), headers=UA_HEADERS, timeout=20)
+            r.raise_for_status()
+            pairs = r.json().get("pairs") or []
+        except Exception:
+            continue
+        wanted = {a.lower() for a in chunk}
+        for pr in pairs:
+            if pr.get("chainId") != "base":
+                continue
+            base_tok = (pr.get("baseToken") or {})
+            a = _norm(base_tok.get("address"))
+            if a not in wanted:
+                continue
+            try:
+                price = float(pr.get("priceUsd") or 0)
+                liq = float((pr.get("liquidity") or {}).get("usd") or 0)
+            except Exception:
+                continue
+            if price <= 0:
+                continue
+            cur = best.get(a)
+            if cur is None or liq > cur["liq"]:
+                best[a] = {"price": price, "liq": liq, "symbol": base_tok.get("symbol") or "?"}
+        time.sleep(0.25)
+    return best
+
+
+def _decimals_batch(tokens: list) -> dict:
+    """decimals() for many tokens in one JSON-RPC batch (uses the process-wide cache)."""
+    need = [t for t in tokens if _DECIMALS_CACHE.get(t.lower()) is None]
+    if need:
+        try:
+            res = _rpc_batch([("eth_call", [{"to": t, "data": "0x313ce567"}, "latest"]) for t in need])
+        except Exception:
+            res = [None] * len(need)
+        for t, r in zip(need, res):
+            try:
+                _DECIMALS_CACHE[t.lower()] = int(r, 16)
+            except Exception:
+                _DECIMALS_CACHE[t.lower()] = 18  # sane default, avoids retrying forever
+    return {t.lower(): _DECIMALS_CACHE.get(t.lower(), 18) for t in tokens}
+
+
+def fetch_other_tokens_value(wallet: str = GROK_WALLET) -> dict:
+    """Total USD held in every OTHER token on Base (PAWS, CHEAPZ, ...).
+
+    Returns {"usd": float, "count": int, "items": [{symbol, address, amount, usd}, ...]}.
+    Cached 15 min; a failure returns the previous value instead of zero."""
+    now = time.time()
+    cached = _OTHER_TOKENS_CACHE.get("data")
+    if cached and (now - _OTHER_TOKENS_CACHE["ts"]) < _OTHER_TOKENS_TTL:
+        return cached
+
+    try:
+        balances = _alchemy_erc20_balances(wallet)
+    except Exception as e:
+        print("other tokens: balance scan failed:", repr(e))
+        balances = {}
+
+    for forced in OTHER_TOKENS_FORCE:
+        a = _norm(forced)
+        if a and a not in balances:
+            try:
+                raw = erc20_balance_of(forced, wallet)
+                if raw > 0:
+                    balances[a] = raw
+            except Exception:
+                pass
+
+    excluded = _other_tokens_excluded()
+    addrs = [a for a in balances if a not in excluded]
+    if not addrs:
+        data = {"usd": 0.0, "count": 0, "items": []}
+        _OTHER_TOKENS_CACHE.update({"ts": now, "data": data})
+        return data
+
+    prices = _dexscreener_batch_prices(addrs)
+    liquid = [a for a, p in prices.items() if p["liq"] >= OTHER_TOKENS_MIN_LIQ_USD]
+    if not liquid and cached:
+        return cached
+
+    decs = _decimals_batch(liquid)
+    items = []
+    for a in liquid:
+        amount = balances[a] / 10 ** decs.get(a, 18)
+        usd = amount * prices[a]["price"]
+        if usd >= OTHER_TOKENS_MIN_VALUE_USD:
+            items.append({"symbol": prices[a]["symbol"], "address": a, "amount": amount, "usd": usd})
+    items.sort(key=lambda x: x["usd"], reverse=True)
+    data = {"usd": float(sum(i["usd"] for i in items)), "count": len(items), "items": items}
+    _OTHER_TOKENS_CACHE.update({"ts": now, "data": data})
+    return data
+
+
 # ================= BALANCES =================
 
 def fetch_balances_and_values():
@@ -539,13 +720,15 @@ def fetch_balances_and_values():
     weth_raw = erc20_balance_of(WETH_TOKEN, GROK_WALLET)
     usdc_raw = erc20_balance_of(USDC_TOKEN, GROK_WALLET)
 
-    # Native ETH balance via eth_getBalance
+    # Native ETH balance via eth_getBalance (Base) + native ETH on Ethereum mainnet
     eth_raw = int(_rpc_call("eth_getBalance", [GROK_WALLET, "latest"]), 16)
+    eth_base_amt = eth_raw / 10 ** 18
+    eth_mainnet_amt = fetch_mainnet_eth_balance(GROK_WALLET)
 
     drb_amt = drb_raw / 10 ** drb_dec
     weth_amt = weth_raw / 10 ** weth_dec
     usdc_amt = usdc_raw / 10 ** usdc_dec  # USDC = 6 decimals, price = $1
-    eth_amt = eth_raw / 10 ** 18
+    eth_amt = eth_base_amt + eth_mainnet_amt
 
     drb_price = fetch_price_usd(DRB_TOKEN)
     weth_price = fetch_price_usd(WETH_TOKEN)
@@ -554,6 +737,13 @@ def fetch_balances_and_values():
     weth_usd = weth_amt * weth_price
     usdc_usd = usdc_amt  # 1 USDC = $1
     eth_usd = eth_amt * weth_price  # ETH price ~= WETH price
+
+    # Every other token held on Base (PAWS, CHEAPZ, ...) collapsed into one line
+    try:
+        other = fetch_other_tokens_value(GROK_WALLET)
+    except Exception as e:
+        print("other tokens error:", repr(e))
+        other = {"usd": 0.0, "count": 0, "items": []}
 
     return {
         "DRB": {
@@ -580,6 +770,14 @@ def fetch_balances_and_values():
             "usd": fmt_usd(usdc_usd),
             "usd_float": float(usdc_usd),
         },
+        "OTHER": {
+            "amount": f"{other['count']} tokens",
+            "amount_float": float(other["count"]),
+            "usd": fmt_usd(other["usd"]),
+            "usd_float": float(other["usd"]),
+            "items": other["items"],
+        },
+        "_eth_split": {"base": float(eth_base_amt), "mainnet": float(eth_mainnet_amt)},
     }
 
 
@@ -594,8 +792,10 @@ def generate_balance_donut(
     eth_amount_float: float = 0.0,
     usdc_usd: float = 0.0,
     usdc_amount_float: float = 0.0,
+    other_usd: float = 0.0,
+    other_count: int = 0,
 ):
-    total = drb_usd + weth_usd + eth_usd + usdc_usd
+    total = drb_usd + weth_usd + eth_usd + usdc_usd + other_usd
 
     drb_amount_label = fmt_compact_b(drb_amount_float)
     weth_amount_label = f"{weth_amount_float:,.2f}"
@@ -605,9 +805,11 @@ def generate_balance_donut(
     else:
         usdc_amount_label = f"{usdc_amount_float:.1f}"
 
-    values = [drb_usd, weth_usd, eth_usd, usdc_usd]
-    colors = [DRB_COLOR, WETH_COLOR, ETH_COLOR, USDC_COLOR]
-    labels = [f"DRB\n{drb_amount_label}", f"WETH\n{weth_amount_label}", f"ETH\n{eth_amount_label}", f"USDC\n{usdc_amount_label}"]
+    other_label = f"OTHER\n{other_count} tokens" if other_count else "OTHER"
+
+    values = [drb_usd, weth_usd, eth_usd, usdc_usd, other_usd]
+    colors = [DRB_COLOR, WETH_COLOR, ETH_COLOR, USDC_COLOR, OTHER_COLOR]
+    labels = [f"DRB\n{drb_amount_label}", f"WETH\n{weth_amount_label}", f"ETH\n{eth_amount_label}", f"USDC\n{usdc_amount_label}", other_label]
 
     # Filter out zero values to avoid empty wedges
     filtered = [(v, c, l) for v, c, l in zip(values, colors, labels) if v > 0]
@@ -630,6 +832,10 @@ def generate_balance_donut(
     ax.text(0, -0.20, "Total Balance", ha="center", va="center", fontsize=11, color="#666")
 
     for w, t in zip(wedges, labels):
+        # Slices too thin to fit their label (e.g. a small "OTHER" bag) stay
+        # unlabelled — they still count towards the total in the middle.
+        if (w.theta2 - w.theta1) < 12.0:
+            continue
         ang = (w.theta1 + w.theta2) / 2.0
         r = 0.82
         x = r * (math.cos(math.radians(ang)))
@@ -663,6 +869,9 @@ def make_balance_table_caption(
     usdc_amount_str: str,
     usdc_usd_str: str,
     fees: str | None,
+    other_usd_float: float = 0.0,
+    other_count: int = 0,
+    eth_mainnet_amount: float = 0.0,
 ) -> str:
     """Build the CLAWD-style stats caption for /grok."""
     now = time.time()
@@ -702,8 +911,11 @@ def make_balance_table_caption(
     drb_compact = _fmt_big(drb_amount_float)
     lines.append(f"{drb_compact} DRB ({drb_usd_str})")
     lines.append(f"{weth_amount_str} WETH ({weth_usd_str})")
-    lines.append(f"{eth_amount_str} ETH ({eth_usd_str})")
+    eth_note = f" · incl. {eth_mainnet_amount:,.2f} on mainnet" if eth_mainnet_amount > 0 else ""
+    lines.append(f"{eth_amount_str} ETH ({eth_usd_str}){eth_note}")
     lines.append(f"{usdc_amount_str} USDC ({usdc_usd_str})")
+    other_suffix = f" ({other_count})" if other_count else ""
+    lines.append(f"Other tokens{other_suffix}: {_fmt_int_usd(other_usd_float)}")
 
     # Total value
     try:
@@ -711,7 +923,7 @@ def make_balance_table_caption(
         weth_val = float(weth_usd_str.replace("$", "").replace(",", ""))
         eth_val = float(eth_usd_str.replace("$", "").replace(",", ""))
         usdc_val = float(usdc_usd_str.replace("$", "").replace(",", ""))
-        total_value = drb_val + weth_val + eth_val + usdc_val
+        total_value = drb_val + weth_val + eth_val + usdc_val + float(other_usd_float or 0.0)
         lines.append(f"Total value: {_fmt_int_usd(total_value)}")
     except Exception:
         pass
@@ -955,6 +1167,8 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             eth_amount_float=b["ETH"]["amount_float"],
             usdc_usd=b["USDC"]["usd_float"],
             usdc_amount_float=b["USDC"]["amount_float"],
+            other_usd=b["OTHER"]["usd_float"],
+            other_count=int(b["OTHER"]["amount_float"]),
         )
 
         caption = make_balance_table_caption(
@@ -967,6 +1181,9 @@ async def grok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             usdc_amount_str=b["USDC"]["amount"],
             usdc_usd_str=b["USDC"]["usd"],
             fees=None,
+            other_usd_float=b["OTHER"]["usd_float"],
+            other_count=int(b["OTHER"]["amount_float"]),
+            eth_mainnet_amount=float((b.get("_eth_split") or {}).get("mainnet") or 0.0),
         )
 
         await msg.reply_photo(photo=donut, caption=caption, parse_mode="HTML")
@@ -989,7 +1206,8 @@ async def grok2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         b = fetch_balances_cached()
-        total_usd = b["DRB"]["usd_float"] + b["WETH"]["usd_float"] + b["ETH"]["usd_float"] + b["USDC"]["usd_float"]
+        total_usd = (b["DRB"]["usd_float"] + b["WETH"]["usd_float"] + b["ETH"]["usd_float"]
+                     + b["USDC"]["usd_float"] + b["OTHER"]["usd_float"])
 
         card = generate_grok_web_style_card(
             total_usd=total_usd,
@@ -2435,16 +2653,17 @@ async def claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---- State (persisted JSON) ----
 
 DEFAULT_STATE = {
-    "min_usd": {"buy": DEFAULT_MIN_BUY_USD},
-    "emoji_usd": {"buy": DEFAULT_EMOJI_USD},
+    "min_usd": {"buy": DEFAULT_MIN_BUY_USD, "whale": DEFAULT_MIN_WHALE_USD},
+    "emoji_usd": {"buy": DEFAULT_EMOJI_USD, "whale": DEFAULT_WHALE_EMOJI_USD},
     "alerts_dm": True,
     "blacklist": [],    # user ids blocked for spamming (auto; admin can unblock)
     "alert_chats": [],  # groups/channels where the bot has been added (auto-registered)
     "watch": {
         "last_scanned_block": 0,
-        "seen": {"buy": []},
-        "sent_public": {"buy": []},
-        "sent_dm": {"buy": []},
+        "last_scanned_block_whale": 0,
+        "seen": {"buy": [], "whale": []},
+        "sent_public": {"buy": [], "whale": []},
+        "sent_dm": {"buy": [], "whale": []},
     },
     "cache": {"token_price_usd": None},
 }
@@ -2479,9 +2698,11 @@ def _load_state() -> dict:
         w = s.get("watch") or {}
         if isinstance(w, dict):
             merged["watch"]["last_scanned_block"] = int(w.get("last_scanned_block") or 0)
+            merged["watch"]["last_scanned_block_whale"] = int(w.get("last_scanned_block_whale") or 0)
             for k in ("seen", "sent_public", "sent_dm"):
                 if isinstance(w.get(k), dict):
-                    merged["watch"][k]["buy"] = list(w[k].get("buy") or [])
+                    for kind in ("buy", "whale"):
+                        merged["watch"][k][kind] = list(w[k].get(kind) or [])
         return merged
     except Exception:
         return merged
@@ -2943,11 +3164,11 @@ def _sell_from_receipt(tx_hash: str, receipt: dict):
 
 # ---- Alert formatting / sending ----
 
-def _emoji_bar(total_usd: float, usd_per_emoji: float) -> str:
+def _emoji_bar(total_usd: float, usd_per_emoji: float, emoji: str = None) -> str:
     if usd_per_emoji <= 0:
         usd_per_emoji = 100.0
     n = int(total_usd / usd_per_emoji)
-    return BUY_EMOJI * max(1, min(n, MAX_EMOJIS))
+    return (emoji or BUY_EMOJI) * max(1, min(n, MAX_EMOJIS))
 
 
 def _payment_line(pay: dict) -> str:
@@ -3143,6 +3364,238 @@ async def buy_monitor(app) -> None:
         await asyncio.sleep(WATCH_POLL_SEC)
 
 
+
+# ================= WHALE WATCHER =================
+#
+# Follows ONE wallet (WHALE_WALLET) and alerts on every DRB it accumulates:
+# DEX buys, but also OTC / CEX-withdrawal style plain transfers in (the way this
+# wallet actually picks up size). Any tx where the wallet's NET DRB delta is
+# positive counts; the payment leg is reported when it can be read from the receipt.
+
+def _whale_topic() -> str:
+    return "0x" + _pad32_hex_address(WHALE_WALLET)
+
+
+def _get_whale_inflow_logs(from_block: int, to_block: int) -> list:
+    """DRB Transfer logs whose `to` is the whale wallet, chunked eth_getLogs."""
+    logs = []
+    cur = from_block
+    topic_to = _whale_topic()
+    while cur <= to_block:
+        end = min(to_block, cur + max(1, WATCH_LOG_CHUNK) - 1)
+        chunk = _rpc_call("eth_getLogs", [{
+            "fromBlock": hex(cur),
+            "toBlock": hex(end),
+            "address": DRB_TOKEN,
+            "topics": [TRANSFER_TOPIC0, None, topic_to],
+        }])
+        logs.extend(chunk or [])
+        cur = end + 1
+    return logs
+
+
+def _whale_acquisition_from_receipt(tx_hash: str, receipt: dict):
+    """Net DRB gained by the whale in this tx, plus what it paid (if readable).
+
+    Returns {tokens, usd, pay:{eth,usdc,usdt,weth}, spent_usd, kind} or None."""
+    if not receipt or str(receipt.get("status", "0x1")).lower() not in ("0x1", "1"):
+        return None
+    block_number = _receipt_block_number(receipt)
+    whale = _norm(WHALE_WALLET)
+
+    deltas = _aggregate_net_deltas_from_receipt(receipt, [DRB_TOKEN, USDC_TOKEN, USDT_TOKEN, WETH_TOKEN])
+    tdel = deltas.get(_norm(DRB_TOKEN)) or {}
+    gained = int(tdel.get(whale, 0))
+    if gained <= 0:
+        return None  # net-out or neutral: not an acquisition
+
+    tokens = gained / 10 ** erc20_decimals(DRB_TOKEN)
+    usd = _drb_price_cached() * tokens
+
+    # What the whale paid with, read from its own outflows in the same tx
+    usdc_del = deltas.get(_norm(USDC_TOKEN)) or {}
+    usdt_del = deltas.get(_norm(USDT_TOKEN)) or {}
+    weth_del = deltas.get(_norm(WETH_TOKEN)) or {}
+    usdc_spent = max(0, -int(usdc_del.get(whale, 0))) / 10 ** 6
+    usdt_spent = max(0, -int(usdt_del.get(whale, 0))) / 10 ** 6
+    weth_spent = max(0, -int(weth_del.get(whale, 0))) / 10 ** 18
+
+    eth_spent = 0.0
+    try:
+        tx = _get_tx(tx_hash) or {}
+        if _norm(tx.get("from", "")) == whale:
+            eth_spent = int(tx.get("value", "0x0"), 16) / 10 ** 18
+    except Exception:
+        pass
+
+    spent_usd = usdc_spent + usdt_spent
+    if eth_spent > 0 or weth_spent > 0:
+        wp = _eth_usd_price(block_number, allow_live_fallback=True) or 0.0
+        spent_usd += (eth_spent + weth_spent) * wp
+
+    kind = "buy" if spent_usd > 0 else "transfer"
+    return {
+        "tokens": float(tokens),
+        "usd": float(usd),
+        "spent_usd": float(spent_usd),
+        "kind": kind,
+        "pay": {"eth": float(eth_spent), "usdc": float(usdc_spent),
+                "usdt": float(usdt_spent), "weth": float(weth_spent)},
+    }
+
+
+def _whale_balance_and_value():
+    """(DRB balance, USD value) of the whale wallet right now."""
+    try:
+        raw = erc20_balance_of(DRB_TOKEN, WHALE_WALLET)
+        amt = raw / 10 ** erc20_decimals(DRB_TOKEN)
+    except Exception:
+        return None, None
+    return float(amt), float(amt * _drb_price_cached())
+
+
+def _whale_caption(tx_hash: str, acq: dict) -> str:
+    state = _load_state()
+    usd_for_bar = acq["usd"] if acq["usd"] > 0 else acq["spent_usd"]
+    bar = _emoji_bar(usd_for_bar, float(state["emoji_usd"].get("whale") or DEFAULT_WHALE_EMOJI_USD), WHALE_EMOJI)
+    tx_url = f"https://basescan.org/tx/{tx_hash}"
+    wallet_url = f"https://basescan.org/address/{WHALE_WALLET}"
+
+    bal_amt, bal_usd = _whale_balance_and_value()
+    if bal_amt is None:
+        balance_line = ""
+    else:
+        balance_line = f"Balance: {_fmt_big(bal_amt)} DRB ({_fmt_int_usd(bal_usd)})\n"
+
+    return (
+        f"<b>{WHALE_EMOJI} WHALE BUYING</b>\n\n"
+        f"{bar}\n\n"
+        f'DRB: {_fmt_big(acq["tokens"])} ({_fmt_int_usd(acq["usd"])}) (<a href="{tx_url}">Tx</a>)\n'
+        + _payment_line(acq.get("pay"))
+        + balance_line
+        + f'Wallet: <a href="{wallet_url}">{_short_addr_dots(WHALE_WALLET)}</a>'
+    )
+
+
+async def _send_whale_alert(app, chat_id: int, caption: str) -> None:
+    asset = ASSET_WHALE if (ASSET_WHALE and os.path.exists(ASSET_WHALE)) else ASSET_BUY
+    if asset and os.path.exists(asset):
+        with open(asset, "rb") as f:
+            await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
+    else:
+        await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+
+
+def _whale_tick_sync() -> list:
+    """Scan new blocks for DRB landing on the whale wallet. Returns [(uid, caption), ...]."""
+    if not WHALE_WALLET:
+        return []
+    state = _load_state()
+    latest = _get_latest_block()
+    end = max(0, latest - max(0, WATCH_CONFIRMATIONS))
+    last_scanned = int(state["watch"].get("last_scanned_block_whale") or 0)
+    start = max(0, end - 5) if last_scanned <= 0 else max(0, last_scanned - WATCH_OVERLAP_BLOCKS)
+    if end < start:
+        return []
+
+    logs = _get_whale_inflow_logs(start, end)
+    seen = set(state["watch"]["seen"].get("whale") or [])
+    min_usd = float(state["min_usd"].get("whale") or 0.0)
+
+    txs = []
+    for lg in logs:
+        h = lg.get("transactionHash")
+        if h and h not in txs and f"whale:{h}" not in seen:
+            txs.append(h)
+
+    receipts = {}
+    for i in range(0, len(txs), 75):
+        chunk = txs[i:i + 75]
+        try:
+            res = _rpc_batch([("eth_getTransactionReceipt", [h]) for h in chunk])
+        except Exception:
+            res = [None] * len(chunk)
+        receipts.update(dict(zip(chunk, res)))
+
+    outgoing = []
+    for h in txs:
+        uid = f"whale:{h}"
+        try:
+            receipt = receipts.get(h)
+            if receipt is None:
+                continue  # retry next tick within the overlap window
+            acq = _whale_acquisition_from_receipt(h, receipt)
+            if acq:
+                value = max(acq["usd"], acq["spent_usd"])
+                if value >= min_usd and not _event_is_too_old(_receipt_block_number(receipt)):
+                    outgoing.append((uid, _whale_caption(h, acq)))
+            seen.add(uid)
+        except Exception as e:
+            print("whale tick error:", h, repr(e))
+
+    def _persist(s):
+        s["watch"]["last_scanned_block_whale"] = end
+        s["watch"]["seen"]["whale"] = _prune_seen(list(seen))
+    _update_state_fields(_persist)
+    return outgoing
+
+
+async def whale_monitor(app) -> None:
+    while True:
+        try:
+            outgoing = await asyncio.to_thread(_whale_tick_sync)
+            if outgoing:
+                state = _load_state()
+                sent_pub = set(state["watch"]["sent_public"].get("whale") or [])
+                sent_dm = set(state["watch"]["sent_dm"].get("whale") or [])
+                dm_enabled = bool(state.get("alerts_dm", True)) and ADMIN_ID > 0
+
+                chats = _alert_chat_ids()
+                for uid, caption in outgoing:
+                    if chats and uid not in sent_pub:
+                        for cid in chats:
+                            try:
+                                await _send_whale_alert(app, cid, caption)
+                            except Exception as e:
+                                print(f"[whale] send to {cid} failed: {e!r}")
+                                if "chat not found" in str(e).lower() or "kicked" in str(e).lower() or "forbidden" in str(e).lower():
+                                    _register_alert_chat(cid, False)
+                        sent_pub.add(uid)
+                        _sp = _prune_seen(list(sent_pub))
+                        _update_state_fields(lambda s, _sp=_sp: s["watch"]["sent_public"].__setitem__("whale", _sp))
+                    if dm_enabled and uid not in sent_dm:
+                        sent_dm.add(uid)
+                        _sd = _prune_seen(list(sent_dm))
+                        _update_state_fields(lambda s, _sd=_sd: s["watch"]["sent_dm"].__setitem__("whale", _sd))
+                        await _send_whale_alert(app, ADMIN_ID, caption)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("whale_monitor error:", repr(e))
+        await asyncio.sleep(WATCH_POLL_SEC)
+
+
+async def whale_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/whale -> current DRB position of the watched wallet."""
+    msg = update.message
+    if not msg:
+        return
+    try:
+        amt, usd = await asyncio.to_thread(_whale_balance_and_value)
+        if amt is None:
+            await msg.reply_text("Error fetching whale balance")
+            return
+        wallet_url = f"https://basescan.org/address/{WHALE_WALLET}"
+        await msg.reply_text(
+            f"<b>{WHALE_EMOJI} WHALE</b>\n"
+            f'<a href="{wallet_url}">{_short_addr_dots(WHALE_WALLET)}</a>\n'
+            f"Balance: {_fmt_big(amt)} DRB ({_fmt_int_usd(usd)})",
+            parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        print("whale_command error:", repr(e))
+        await msg.reply_text("Error fetching whale balance")
+
+
 # ---- Commands: /setmin /setemoji /alerts /scan ----
 
 def _is_admin_user(update: Update) -> bool:
@@ -3156,17 +3609,19 @@ async def setmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_user(update):
         await update.message.reply_text("Not allowed.")
         return
-    args = [a for a in (context.args or []) if a.lower() != "buy"]
+    raw = [a for a in (context.args or [])]
+    kind = "whale" if raw and raw[0].lower() == "whale" else "buy"
+    args = [a for a in raw if a.lower() not in ("buy", "whale")]
     if len(args) != 1:
-        await update.message.reply_text("Usage: /setmin <usd>")
+        await update.message.reply_text("Usage: /setmin [buy|whale] <usd>")
         return
     try:
         usd = max(0.0, float(args[0]))
     except Exception:
         await update.message.reply_text("Invalid usd.")
         return
-    _update_state_fields(lambda s: s["min_usd"].__setitem__("buy", usd))
-    await update.message.reply_text(f"OK. Minimum buy alert = ${usd:,.0f}")
+    _update_state_fields(lambda s: s["min_usd"].__setitem__(kind, usd))
+    await update.message.reply_text(f"OK. Minimum {kind} alert = ${usd:,.0f}")
 
 
 async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3175,17 +3630,20 @@ async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_user(update):
         await update.message.reply_text("Not allowed.")
         return
-    args = [a for a in (context.args or []) if a.lower() != "buy"]
+    raw = [a for a in (context.args or [])]
+    kind = "whale" if raw and raw[0].lower() == "whale" else "buy"
+    args = [a for a in raw if a.lower() not in ("buy", "whale")]
     if len(args) != 1:
-        await update.message.reply_text("Usage: /setemoji <usd_per_emoji>")
+        await update.message.reply_text("Usage: /setemoji [buy|whale] <usd_per_emoji>")
         return
     try:
         usd_per = max(0.01, float(args[0]))
     except Exception:
         await update.message.reply_text("Invalid usd_per_emoji.")
         return
-    _update_state_fields(lambda s: s["emoji_usd"].__setitem__("buy", usd_per))
-    await update.message.reply_text(f"OK. 1 {BUY_EMOJI} = ${usd_per:,.2f} (max {MAX_EMOJIS})")
+    _update_state_fields(lambda s: s["emoji_usd"].__setitem__(kind, usd_per))
+    emo = WHALE_EMOJI if kind == "whale" else BUY_EMOJI
+    await update.message.reply_text(f"OK. 1 {emo} = ${usd_per:,.2f} (max {MAX_EMOJIS})")
 
 
 async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3339,10 +3797,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/grok2 – Grok wallet card\n"
         "/stats [7d|4w] – claim stats\n"
         "/buys [7d] – biggest buys\n"
+        "/whale – watched whale DRB position\n"
         "/claim – claim trading fees (admins)\n\n"
-        "Buy alerts (admin only)\n"
-        "/setmin <usd> – minimum buy to alert\n"
-        "/setemoji <usd> – USD per emoji in the bar\n"
+        "Buy / whale alerts (admin only)\n"
+        "/setmin [buy|whale] <usd> – minimum size to alert\n"
+        "/setemoji [buy|whale] <usd> – USD per emoji in the bar\n"
         "/alerts on|off – DM alerts to admin\n"
         "/alerts chats – list groups receiving alerts (auto-registered when the bot is added)\n"
         "/scan <tx_hash> – test detection on a tx\n"
@@ -3426,6 +3885,7 @@ async def on_startup(app):
     _ensure_data_dir()
     _load_last_claim()
     app.bot_data["monitor_task"] = asyncio.create_task(buy_monitor(app))
+    app.bot_data["whale_task"] = asyncio.create_task(whale_monitor(app))
     if ADMIN_ID > 0:
         try:
             await app.bot.send_message(chat_id=ADMIN_ID, text=f"ASSET_BUY={ASSET_BUY} exists={os.path.exists(ASSET_BUY)}")
@@ -3434,13 +3894,14 @@ async def on_startup(app):
 
 
 async def on_shutdown(app):
-    t = app.bot_data.get("monitor_task")
-    if t and not t.done():
-        t.cancel()
-        try:
-            await t
-        except (asyncio.CancelledError, Exception):
-            pass
+    for key in ("monitor_task", "whale_task"):
+        t = app.bot_data.get(key)
+        if t and not t.done():
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def main():
@@ -3456,6 +3917,7 @@ def main():
     app.add_handler(CommandHandler("grok2", grok2_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("buys", buys_command))
+    app.add_handler(CommandHandler("whale", whale_command))
     app.add_handler(CommandHandler("claim", claim_command))
     app.add_handler(CallbackQueryHandler(claim_callback, pattern="^claim_"))
     app.add_handler(CommandHandler("help", help_command))
