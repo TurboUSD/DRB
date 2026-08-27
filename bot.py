@@ -911,8 +911,7 @@ def make_balance_table_caption(
     drb_compact = _fmt_big(drb_amount_float)
     lines.append(f"{drb_compact} DRB ({drb_usd_str})")
     lines.append(f"{weth_amount_str} WETH ({weth_usd_str})")
-    eth_note = f" · incl. {eth_mainnet_amount:,.2f} on mainnet" if eth_mainnet_amount > 0 else ""
-    lines.append(f"{eth_amount_str} ETH ({eth_usd_str}){eth_note}")
+    lines.append(f"{eth_amount_str} ETH ({eth_usd_str})")
     lines.append(f"{usdc_amount_str} USDC ({usdc_usd_str})")
     other_suffix = f" ({other_count})" if other_count else ""
     lines.append(f"Other tokens{other_suffix}: {_fmt_int_usd(other_usd_float)}")
