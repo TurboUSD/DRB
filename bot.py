@@ -111,8 +111,11 @@ ASSET_BUY = os.environ.get("ASSET_BUY", "assets/DRB_buy.png")
 WATERMARK_TEXT = os.environ.get("WATERMARK_TEXT", "@TonySopraNFTo")
 WATERMARK_ENABLED = os.environ.get("WATERMARK_ENABLED", "1") not in ("0", "false", "False")
 WATERMARK_HEIGHT_PCT = float(os.environ.get("WATERMARK_HEIGHT_PCT", "0.030"))  # font size vs image height
-WATERMARK_MAX_WIDTH_PCT = float(os.environ.get("WATERMARK_MAX_WIDTH_PCT", "0.22"))  # never wider than this
-WATERMARK_MARGIN_PCT = float(os.environ.get("WATERMARK_MARGIN_PCT", "0.025"))  # margin vs shortest side
+WATERMARK_MAX_WIDTH_PCT = float(os.environ.get("WATERMARK_MAX_WIDTH_PCT", "0.55"))  # never wider than this
+# The /grok donut has empty space under the chart: there the stamp is sized to
+# a fraction of the image width instead of the text height.
+WATERMARK_DONUT_WIDTH_PCT = float(os.environ.get("WATERMARK_DONUT_WIDTH_PCT", "0.3333"))
+WATERMARK_MARGIN_PCT = float(os.environ.get("WATERMARK_MARGIN_PCT", "0.022"))  # margin vs shortest side
 WATERMARK_OPACITY = int(os.environ.get("WATERMARK_OPACITY", "235"))            # 0-255
 BUY_EMOJI = os.environ.get("BUY_EMOJI", "🤖")
 MAX_EMOJIS = 100
@@ -465,10 +468,14 @@ def _watermark_font(size: int):
     ], size)
 
 
-def apply_watermark(img: Image.Image) -> Image.Image:
+def apply_watermark(img: Image.Image, width_pct: float = None) -> Image.Image:
     """Stamp WATERMARK_TEXT on the bottom-right corner, in whichever of black /
     white contrasts with what is already there (plus a thin opposite outline, so
-    it stays readable over a busy corner)."""
+    it stays readable over a busy corner).
+
+    width_pct: if given, the stamp is scaled so it spans that fraction of the
+    image width (used by the /grok donut). Otherwise it is sized from the image
+    height and only shrunk if it would grow past WATERMARK_MAX_WIDTH_PCT."""
     if not WATERMARK_ENABLED or not WATERMARK_TEXT:
         return img
     im = img.convert("RGBA")
@@ -477,16 +484,40 @@ def apply_watermark(img: Image.Image) -> Image.Image:
         return img
 
     probe = ImageDraw.Draw(im)
-    size = max(11, int(H * WATERMARK_HEIGHT_PCT))
-    # Shrink until the stamp fits inside its width budget, so it can never creep
-    # across the artwork on short/wide banners (the buy alert card).
-    for _ in range(24):
-        font = _watermark_font(size)
-        bbox = probe.textbbox((0, 0), WATERMARK_TEXT, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        if tw <= W * WATERMARK_MAX_WIDTH_PCT or size <= 11:
-            break
-        size -= 1
+
+    def _measure(sz):
+        f = _watermark_font(sz)
+        bb = probe.textbbox((0, 0), WATERMARK_TEXT, font=f)
+        return f, bb, bb[2] - bb[0], bb[3] - bb[1]
+
+    if width_pct and width_pct > 0:
+        target = W * width_pct
+        size = max(11, int(H * WATERMARK_HEIGHT_PCT))
+        font, bbox, tw, th = _measure(size)
+        if tw > 0:  # one proportional jump, then nudge to land on the target
+            size = max(11, min(int(H * 0.5), int(size * target / tw)))
+            font, bbox, tw, th = _measure(size)
+        for _ in range(40):
+            if tw > target and size > 11:
+                size -= 1
+            elif tw < target * 0.97:
+                size += 1
+            else:
+                break
+            font, bbox, tw, th = _measure(size)
+            if tw > target:
+                size -= 1
+                font, bbox, tw, th = _measure(size)
+                break
+    else:
+        size = max(11, int(H * WATERMARK_HEIGHT_PCT))
+        # Shrink until the stamp fits inside its width budget, so it can never
+        # creep across the artwork on short/wide banners (the buy alert card).
+        for _ in range(24):
+            font, bbox, tw, th = _measure(size)
+            if tw <= W * WATERMARK_MAX_WIDTH_PCT or size <= 11:
+                break
+            size -= 1
 
     margin = max(8, int(min(W, H) * WATERMARK_MARGIN_PCT))
     x = max(0, W - tw - margin - bbox[0])
@@ -512,23 +543,23 @@ def apply_watermark(img: Image.Image) -> Image.Image:
     return Image.alpha_composite(im, layer)
 
 
-def watermark_png_bytes(data: bytes) -> bytes:
+def watermark_png_bytes(data: bytes, width_pct: float = None) -> bytes:
     """Watermark a PNG/JPEG given as bytes; returns PNG bytes (original on error)."""
     if not WATERMARK_ENABLED or not WATERMARK_TEXT:
         return data
     try:
         out = BytesIO()
-        apply_watermark(Image.open(BytesIO(data))).convert("RGB").save(out, format="PNG", optimize=True)
+        apply_watermark(Image.open(BytesIO(data)), width_pct).convert("RGB").save(out, format="PNG", optimize=True)
         return out.getvalue()
     except Exception as e:
         print("watermark error:", repr(e))
         return data
 
 
-def watermark_buf(buf: BytesIO) -> BytesIO:
+def watermark_buf(buf: BytesIO, width_pct: float = None) -> BytesIO:
     """Watermark an in-memory image buffer (as produced by matplotlib / PIL)."""
     buf.seek(0)
-    out = BytesIO(watermark_png_bytes(buf.read()))
+    out = BytesIO(watermark_png_bytes(buf.read(), width_pct))
     out.seek(0)
     return out
 
@@ -960,7 +991,7 @@ def generate_balance_donut(
     plt.savefig(buf, format="png", dpi=170, bbox_inches="tight")
     buf.seek(0)
     plt.close(fig)
-    return watermark_buf(buf)
+    return watermark_buf(buf, WATERMARK_DONUT_WIDTH_PCT)
 
 
 def make_balance_table_caption(
