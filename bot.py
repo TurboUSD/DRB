@@ -3991,10 +3991,12 @@ async def send_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("\u26D4 Admin only.", show_alert=True)
         return
     key = (query.data or "")[8:]
-    caption = _PENDING_GROUP_POSTS.get(key)
-    if not caption:
+    post = _PENDING_GROUP_POSTS.get(key)
+    if not post:
         await query.answer("Expired — run /scan on the tx again.", show_alert=True)
         return
+    caption = post["caption"] if isinstance(post, dict) else post
+    kind = post.get("kind", "text") if isinstance(post, dict) else "text"
     chats = _alert_chat_ids()
     if not chats:
         await query.answer("No group registered.", show_alert=True)
@@ -4002,8 +4004,11 @@ async def send_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     sent = 0
     for cid in chats:
         try:
-            await context.bot.send_message(chat_id=cid, text=caption, parse_mode="HTML",
-                                           disable_web_page_preview=True)
+            if kind == "whale":
+                await _send_whale_alert(context.application, cid, caption)
+            else:
+                await context.bot.send_message(chat_id=cid, text=caption, parse_mode="HTML",
+                                               disable_web_page_preview=True)
             sent += 1
         except Exception as e:
             print(f"group post to {cid} failed: {e!r}")
@@ -4058,6 +4063,23 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sell:
             await msg.reply_text("That tx looks like a SELL.")
             return
+        # Whale wallet involved? -> reproduce the exact whale-monitor alert
+        acq = None
+        try:
+            acq = await asyncio.to_thread(_whale_acquisition_from_receipt, tx_hash, receipt)
+        except Exception as e:
+            print("scan whale error:", repr(e))
+        if acq:
+            caption = _whale_caption(tx_hash, acq)
+            key = tx_hash[2:18]
+            _PENDING_GROUP_POSTS[key] = {"caption": caption, "kind": "whale"}
+            if len(_PENDING_GROUP_POSTS) > 50:
+                _PENDING_GROUP_POSTS.pop(next(iter(_PENDING_GROUP_POSTS)))
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "\U0001F4E2 Enviar al grupo", callback_data=f"sendgrp:{key}")]])
+            await _send_whale_alert(context.application, user_id, caption)
+            await msg.reply_text("Whale alert preview sent \u2191", reply_markup=kb)
+            return
         tr = None
         try:
             tr = await asyncio.to_thread(_transfer_from_receipt, tx_hash, receipt)
@@ -4066,7 +4088,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tr:
             caption = _transfer_caption(tx_hash, tr)
             key = tx_hash[2:18]
-            _PENDING_GROUP_POSTS[key] = caption
+            _PENDING_GROUP_POSTS[key] = {"caption": caption, "kind": "text"}
             if len(_PENDING_GROUP_POSTS) > 50:
                 _PENDING_GROUP_POSTS.pop(next(iter(_PENDING_GROUP_POSTS)))
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(
