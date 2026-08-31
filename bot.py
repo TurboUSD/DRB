@@ -3284,6 +3284,96 @@ async def _scan_range_and_dm(app, user_id: int, blocks_back: int, min_usd: float
     await asyncio.to_thread(_run)
 
 
+# ---- Plain DRB transfer detection (for /scan and manual re-alerts) ----
+
+KNOWN_ADDRESS_LABELS = {
+    "0x26b610a059de2488ebe3e0eda02ae17907917419": "Coinbase Hot Wallet",
+    GROK_WALLET.lower(): "Grok Wallet",
+    CLAIM_CONTRACT.lower(): "Claim Contract",
+}
+
+
+def _transfer_from_receipt(tx_hash: str, receipt: dict):
+    """Detect a plain wallet->wallet DRB transfer (no swap, no payment leg).
+    Returns {from, to, tokens, usd} or None."""
+    if not receipt or str(receipt.get("status", "0x1")).lower() not in ("0x1", "1"):
+        return None
+    deltas = _aggregate_net_deltas_from_receipt(receipt, [DRB_TOKEN, USDC_TOKEN, USDT_TOKEN, WETH_TOKEN])
+    tdel = deltas.get(_norm(DRB_TOKEN)) or {}
+    if not tdel:
+        return None
+    # No payment legs allowed: any meaningful USDC/USDT/WETH movement means swap/LP
+    for tok in (USDC_TOKEN, USDT_TOKEN, WETH_TOKEN):
+        if any(abs(v) > 0 for v in (deltas.get(_norm(tok)) or {}).values()):
+            return None
+    senders = [(a, -v) for a, v in tdel.items() if v < 0]
+    receivers = [(a, v) for a, v in tdel.items() if v > 0]
+    if len(senders) != 1 or len(receivers) != 1:
+        return None
+    frm, out_amt = senders[0]
+    to, in_amt = receivers[0]
+    tokens = in_amt / 10 ** erc20_decimals(DRB_TOKEN)
+    if tokens < 1:
+        return None
+    usd = tokens * _drb_price_cached()
+    return {"from": frm, "to": to, "tokens": float(tokens), "usd": float(usd)}
+
+
+def _addr_label(a: str) -> str:
+    lbl = KNOWN_ADDRESS_LABELS.get(_norm(a))
+    short = _short_addr_dots(a)
+    return f"{lbl} ({short})" if lbl else short
+
+
+def _transfer_caption(tx_hash: str, tr: dict) -> str:
+    tx_url = f"https://basescan.org/tx/{tx_hash}"
+    from_url = f"https://basescan.org/address/{tr['from']}"
+    to_url = f"https://basescan.org/address/{tr['to']}"
+    return (
+        "\U0001F40B <b>DRB TRANSFER</b>\n\n"
+        f"DRB: <b>{_fmt_big(tr['tokens'])}</b> ({_fmt_int_usd(tr['usd'])}) (<a href=\"{tx_url}\">Tx</a>)\n"
+        f"From: <a href=\"{from_url}\">{_addr_label(tr['from'])}</a>\n"
+        f"To: <a href=\"{to_url}\">{_addr_label(tr['to'])}</a>"
+    )
+
+
+# captions parked for "send to group" buttons: short_id -> caption
+_PENDING_GROUP_POSTS = {}
+
+
+async def send_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    user = update.effective_user
+    if not (user and ADMIN_ID > 0 and user.id == ADMIN_ID):
+        await query.answer("\u26D4 Admin only.", show_alert=True)
+        return
+    key = (query.data or "")[8:]
+    caption = _PENDING_GROUP_POSTS.get(key)
+    if not caption:
+        await query.answer("Expired — run /scan on the tx again.", show_alert=True)
+        return
+    chats = _alert_chat_ids()
+    if not chats:
+        await query.answer("No group registered.", show_alert=True)
+        return
+    sent = 0
+    for cid in chats:
+        try:
+            await context.bot.send_message(chat_id=cid, text=caption, parse_mode="HTML",
+                                           disable_web_page_preview=True)
+            sent += 1
+        except Exception as e:
+            print(f"group post to {cid} failed: {e!r}")
+    _PENDING_GROUP_POSTS.pop(key, None)
+    await query.answer(f"Posted to {sent} group(s).")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/scan <tx_hash>  -> test detection on one tx (sends the alert in DM)
        /scan <blocks_back> <min_usd> -> scan a range, results in DM"""
@@ -3324,7 +3414,27 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sell = await asyncio.to_thread(_sell_from_receipt, tx_hash, receipt)
         except Exception:
             pass
-        await msg.reply_text("That tx looks like a SELL." if sell else "That tx is not detected as a DRB buy.")
+        if sell:
+            await msg.reply_text("That tx looks like a SELL.")
+            return
+        # Plain DRB transfer? Show the alert + a button to post it to the group.
+        tr = None
+        try:
+            tr = await asyncio.to_thread(_transfer_from_receipt, tx_hash, receipt)
+        except Exception as e:
+            print("scan transfer error:", repr(e))
+        if tr:
+            caption = _transfer_caption(tx_hash, tr)
+            key = tx_hash[2:18]
+            _PENDING_GROUP_POSTS[key] = caption
+            if len(_PENDING_GROUP_POSTS) > 50:
+                _PENDING_GROUP_POSTS.pop(next(iter(_PENDING_GROUP_POSTS)))
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "\U0001F4E2 Enviar al grupo", callback_data=f"sendgrp:{key}")]])
+            await msg.reply_text(caption, parse_mode="HTML", disable_web_page_preview=True,
+                                 reply_markup=kb)
+            return
+        await msg.reply_text("That tx is not detected as a DRB buy, sell or transfer.")
         return
 
     if len(args) != 2:
@@ -3476,6 +3586,7 @@ def main():
     app.add_handler(CommandHandler("blacklist", blacklist_command))
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CallbackQueryHandler(blacklist_callback, pattern=r"^blk:"))
+    app.add_handler(CallbackQueryHandler(send_group_callback, pattern=r"^sendgrp:"))
     app.add_handler(MessageHandler(filters.COMMAND, command_guard, block=True), group=-1)
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, admin_file_handler), group=0)
     app.add_handler(MessageHandler(filters.ALL, _count_message), group=1)
